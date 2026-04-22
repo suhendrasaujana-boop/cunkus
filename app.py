@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from plotly.subplots import make_subplots
 import os
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== DETEKSI ENVIRONMENT ==========
 IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
@@ -19,8 +20,9 @@ IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
 ENABLE_ML = True          # ML tetap jalan karena ringan
 ENABLE_NEWS = False if IS_CLOUD else True
 ENABLE_SENTIMENT = False if IS_CLOUD else True
+ENABLE_MULTI_TICKER_ML = not IS_CLOUD  # Multi-ticker training hanya di local (agak berat)
 
-# ========== IMPORT OPSIONAL DENGAN PENANGANAN ERROR ==========
+# ========== IMPORT OPSIONAL ==========
 FEEDPARSER_AVAILABLE = False
 TEXTBLOB_AVAILABLE = False
 if ENABLE_NEWS:
@@ -44,13 +46,13 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-# ========== KONSTANTA OPTIMASI ==========
+# ========== KONSTANTA ==========
 if IS_CLOUD:
     DATA_PERIOD = "6mo"
     MAX_CHART_POINTS = 150
     CACHE_TTL = 300
     SCANNER_CACHE_TTL = 900
-    st.warning("☁️ **Mode Cloud Aktif** - Optimasi untuk performa terbaik. Fitur utama 100% berjalan! ML aktif, News nonaktif.")
+    st.warning("☁️ **Mode Cloud Aktif** - Optimasi untuk performa terbaik. Multi-ticker ML dinonaktifkan, ensemble tetap jalan.")
 else:
     DATA_PERIOD = "2y"
     MAX_CHART_POINTS = 500
@@ -94,8 +96,10 @@ if 'user_volume_spike_threshold' not in st.session_state:
     st.session_state.user_volume_spike_threshold = VOLUME_SPIKE_THRESHOLD
 if 'user_breakout_cooldown_hours' not in st.session_state:
     st.session_state.user_breakout_cooldown_hours = BREAKOUT_COOLDOWN_HOURS
-if 'ml_model' not in st.session_state:
-    st.session_state.ml_model = None
+if 'global_ml_model' not in st.session_state:
+    st.session_state.global_ml_model = None
+if 'global_feature_names' not in st.session_state:
+    st.session_state.global_feature_names = []
 
 # ========== FUNGSI BANTU ==========
 def safe_last(series: pd.Series, default=0.0):
@@ -112,6 +116,13 @@ def fix_ticker(ticker: str) -> str:
     if ticker.startswith('^') or ticker.endswith('.JK'):
         return ticker
     return ticker + '.JK'
+
+def async_load_data(tasks: List) -> List:
+    """Jalankan beberapa fungsi secara paralel (ThreadPoolExecutor)."""
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(task) for task in tasks]
+        results = [f.result() for f in futures]
+    return results
 
 def should_notify_breakout(current_price: float, resistance: float) -> bool:
     if current_price <= resistance:
@@ -272,7 +283,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.ffill().fillna(0)
     return df
 
-# ========== RULE-BASED AI SCORE (PERTAHANKAN) ==========
+# ========== RULE-BASED AI SCORE ==========
 def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
     if df.empty:
         return 0
@@ -293,7 +304,7 @@ def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
     ]
     return sum(conditions)
 
-# ========== MACHINE LEARNING FEATURE ENGINE ==========
+# ========== MACHINE LEARNING (SINGLE TICKER) ==========
 def build_ml_features(df: pd.DataFrame, volume: pd.Series) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -328,7 +339,6 @@ def ml_ai_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5):
     labels = create_labels(df, forward_days)
     if len(features) < 50:
         return None, 0
-    # Latih model dengan semua data kecuali 5 hari terakhir untuk hindari leakage
     train_features = features.iloc[:-forward_days]
     train_labels = labels.iloc[:-forward_days]
     if len(train_features) < 30:
@@ -337,21 +347,111 @@ def ml_ai_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5):
     if model is None:
         return None, 0
     latest = features.iloc[-1:].fillna(0)
-    prob = model.predict_proba(latest)[0][1]  # probabilitas naik
+    prob = model.predict_proba(latest)[0][1]
     score = int(prob * 100)
     return model, score
 
-# ========== GLOBAL MACRO CACHE (OPTIMASI) ==========
+# ========== MULTI-TICKER GLOBAL ML (UNTUK ENSEMBLE) ==========
+@st.cache_data(ttl=3600)  # cache 1 jam
+def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
+    """Gabungkan data dari banyak saham untuk training global model."""
+    all_dfs = []
+    for t in tickers:
+        try:
+            df = yf.download(t, period=period, interval="1d", progress=False, auto_adjust=False)
+            if df.empty or len(df) < 50:
+                continue
+            df = df[['Open','High','Low','Close','Volume']].copy()
+            df = df.dropna()
+            # Hitung indikator
+            df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
+            macd = ta.trend.MACD(df['Close'])
+            df['MACD'] = macd.macd()
+            df['MACD_signal'] = macd.macd_signal()
+            df['SMA20'] = df['Close'].rolling(20).mean()
+            df['SMA50'] = df['Close'].rolling(50).mean()
+            df['Volume_MA'] = df['Volume'].rolling(20).mean()
+            df['return_5d'] = df['Close'].pct_change(5)
+            df['volatility'] = df['Close'].pct_change().rolling(10).std()
+            df['target'] = (df['Close'].shift(-5) > df['Close']).astype(int)
+            df = df.dropna()
+            all_dfs.append(df)
+        except Exception:
+            continue
+    if not all_dfs:
+        return pd.DataFrame()
+    combined = pd.concat(all_dfs, ignore_index=True)
+    return combined
+
+def train_global_model(tickers: List[str]):
+    """Latih model global dari multi-ticker dataset."""
+    if not SKLEARN_AVAILABLE:
+        return None, []
+    data = build_multi_ticker_dataset(tickers)
+    if data.empty:
+        return None, []
+    feature_cols = ['RSI', 'MACD', 'MACD_signal', 'SMA20', 'SMA50', 'Volume', 'Volume_MA', 'return_5d', 'volatility']
+    # Pastikan kolom ada
+    feature_cols = [c for c in feature_cols if c in data.columns]
+    X = data[feature_cols].fillna(0)
+    y = data['target']
+    if len(X) < 100:
+        return None, []
+    model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1)
+    model.fit(X, y)
+    return model, feature_cols
+
+def get_global_ml_score(ticker_df: pd.DataFrame, volume: pd.Series, global_model, feature_names):
+    """Gunakan global model untuk memprediksi satu ticker."""
+    if global_model is None or not feature_names:
+        return None
+    # Hitung fitur untuk ticker ini
+    features = pd.DataFrame(index=ticker_df.index)
+    features['RSI'] = ticker_df['RSI']
+    features['MACD'] = ticker_df['MACD']
+    features['MACD_signal'] = ticker_df['MACD_signal']
+    features['SMA20'] = ticker_df['SMA20']
+    features['SMA50'] = ticker_df['SMA50']
+    features['Volume'] = volume
+    features['Volume_MA'] = ticker_df['Volume_MA']
+    features['return_5d'] = ticker_df['Close'].pct_change(5)
+    features['volatility'] = ticker_df['Close'].pct_change().rolling(10).std()
+    features = features.fillna(0)
+    # Pastikan hanya kolom yang dipakai model
+    features = features[feature_names] if all(c in features.columns for c in feature_names) else pd.DataFrame()
+    if features.empty:
+        return None
+    latest = features.iloc[-1:].fillna(0)
+    prob = global_model.predict_proba(latest)[0][1]
+    return int(prob * 100)
+
+# ========== ENSEMBLE SCORE ==========
+def ensemble_score(ml_score: int, rule_score: int, ml_weight: float = 0.6, rule_weight: float = 0.4) -> int:
+    """Gabungkan ML score (0-100) dan rule score (0-100) menjadi final score."""
+    # Rule score dari calculate_ai_score (0-5) di-scale ke 0-100
+    rule_scaled = rule_score * 20
+    if ml_score is None:
+        return rule_scaled
+    final = (ml_weight * ml_score) + (rule_weight * rule_scaled)
+    return int(np.clip(final, 0, 100))
+
+# ========== GLOBAL MACRO CACHE (ASYNC) ==========
 @st.cache_data(ttl=CACHE_TTL)
-def get_macro_data():
-    ihsg = yf.download("^JKSE", period="5d", progress=False)['Close']
-    usd = yf.download("USDIDR=X", period="5d", progress=False)['Close']
-    nasdaq = yf.download("^IXIC", period="5d", progress=False)['Close']
+def get_macro_data_async():
+    """Download macro data secara paralel."""
+    def download_ihsg():
+        return yf.download("^JKSE", period="5d", progress=False)['Close']
+    def download_usd():
+        return yf.download("USDIDR=X", period="5d", progress=False)['Close']
+    def download_nasdaq():
+        return yf.download("^IXIC", period="5d", progress=False)['Close']
+    
+    ihsg, usd, nasdaq = async_load_data([download_ihsg, download_usd, download_nasdaq])
     return ihsg, usd, nasdaq
 
 def get_macro_signal():
     try:
-        ihsg, usd, nasdaq = get_macro_data()
+        ihsg, usd, nasdaq = get_macro_data_async()
         score = 0
         if safe_last(ihsg) > ihsg.mean():
             score += 1
@@ -602,9 +702,21 @@ with st.sidebar:
     st.session_state.user_breakout_cooldown_hours = user_breakout_cooldown
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
+        st.session_state.global_ml_model = None
         st.rerun()
     st.markdown("---")
     st.caption("Data dari Yahoo Finance | Update 5 menit")
+
+# ========== TRAINING GLOBAL MODEL (jika di local) ==========
+if ENABLE_MULTI_TICKER_ML and SKLEARN_AVAILABLE and st.session_state.global_ml_model is None:
+    with st.spinner("Melatih global AI model dari seluruh IHSG (sekali saja)..."):
+        model, features = train_global_model(IHSG_BLUE_CHIPS)
+        if model is not None:
+            st.session_state.global_ml_model = model
+            st.session_state.global_feature_names = features
+            st.success("Global ML model siap!")
+        else:
+            st.warning("Global ML model gagal dilatih. Ensemble tetap berjalan dengan model per ticker.")
 
 # ========== LOAD DATA ==========
 with st.spinner("Memuat data..."):
@@ -703,33 +815,68 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
 
-# ========== TAB 2: AI SIGNAL (DENGAN ML SCORE) ==========
+# ========== TAB 2: AI SIGNAL (DENGAN ENSEMBLE & FEATURE IMPORTANCE) ==========
 with tab2:
-    all_signals = get_all_signals(data, volume, ticker)
-    rule_score = all_signals['ai_score']
+    # Hitung rule score dan ml score
+    rule_score = calculate_ai_score(data, volume)
+    # ML score dari model per ticker (single ticker)
+    _, ml_score_single = ml_ai_score(data, volume, forward_days=5)
+    # ML score dari global model (jika ada)
+    global_ml_score = None
+    if st.session_state.global_ml_model is not None:
+        global_ml_score = get_global_ml_score(data, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
+    # Ensemble: gunakan ML score terbaik (prioritas global jika ada, lalu single)
+    ml_score_final = global_ml_score if global_ml_score is not None else ml_score_single
+    final_ensemble = ensemble_score(ml_score_final, rule_score, ml_weight=0.6, rule_weight=0.4)
     
-    # ML Score
-    ml_model, ml_score = ml_ai_score(data, volume, forward_days=5)
-    if ml_model is not None:
-        st.subheader("🤖 MACHINE LEARNING AI SCORE (RandomForest)")
-        st.metric("ML Probability Naik", f"{ml_score}%")
-        if ml_score >= 70:
-            st.success("🚀 STRONG ML BUY SIGNAL")
-        elif ml_score >= 55:
-            st.info("🟡 ML NEUTRAL / SPECULATIVE")
-        else:
-            st.error("🔻 ML BEARISH SIGNAL")
-        st.caption("Model memprediksi probabilitas harga naik dalam 5 hari ke depan berdasarkan fitur teknikal.")
-        st.divider()
-    
-    st.subheader("📊 RULE-BASED AI SCORE (Indikator Teknikal)")
-    st.metric("Rule Score", f"{rule_score}/5")
-    if rule_score >= 4:
-        st.success("🚀 STRONG BUY")
-    elif rule_score == 3:
-        st.info("🟡 HOLD")
+    st.subheader("🧠 ENSEMBLE AI SCORE (ML + Rule)")
+    st.metric("Ensemble Final Score", f"{final_ensemble}%")
+    if final_ensemble >= 70:
+        st.success("🚀 STRONG BUY SIGNAL")
+    elif final_ensemble >= 55:
+        st.info("🟡 NEUTRAL / SPECULATIVE")
     else:
-        st.error("🔻 SELL")
+        st.error("🔻 AVOID / BEARISH")
+    st.caption("Ensemble menggabungkan ML probability (60%) dan Rule-based score (40%).")
+    st.divider()
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📊 Rule-Based Score (0-5)")
+        st.metric("Rule Score", f"{rule_score}/5")
+        if rule_score >= 4:
+            st.success("STRONG BUY")
+        elif rule_score == 3:
+            st.info("HOLD")
+        else:
+            st.error("SELL")
+    with col2:
+        st.subheader("🤖 ML Probability (0-100%)")
+        if ml_score_final is not None:
+            st.metric("ML Score", f"{ml_score_final}%")
+            if ml_score_final >= 70:
+                st.success("ML: Bullish")
+            elif ml_score_final >= 55:
+                st.info("ML: Neutral")
+            else:
+                st.error("ML: Bearish")
+            if global_ml_score is not None:
+                st.caption("(Menggunakan global IHSG model)")
+            else:
+                st.caption("(Menggunakan model per ticker)")
+        else:
+            st.info("ML tidak tersedia (data kurang)")
+    
+    # Feature Importance (jika global model ada)
+    if st.session_state.global_ml_model is not None and st.session_state.global_feature_names:
+        st.subheader("🔥 Feature Importance (Global Model)")
+        importances = st.session_state.global_ml_model.feature_importances_
+        fi_df = pd.DataFrame({
+            "Feature": st.session_state.global_feature_names,
+            "Importance": importances
+        }).sort_values("Importance", ascending=False)
+        st.bar_chart(fi_df.set_index("Feature"))
+        st.caption("Variabel yang paling mempengaruhi keputusan AI.")
     
     # Risk Meter
     st.subheader("🎯 Risk Meter")
@@ -755,6 +902,7 @@ with tab2:
         risk = "HIGH"
         st.error(f"Risk Level: {risk} ({annual_vol:.1f}% annual)")
 
+    # Probability Engine (sama seperti sebelumnya)
     st.subheader("📊 Probability Engine")
     bull = bear = 0
     rsi = safe_last(data['RSI'], 50)
@@ -915,7 +1063,8 @@ with tab2:
         st.warning("⚠️ Weak Trend")
 
     st.subheader("🏦 Smart Money Flow")
-    smart_score, smart_status = all_signals['smart_score'], all_signals['smart_status']
+    signals = get_all_signals(data, volume, ticker)
+    smart_score, smart_status = signals['smart_score'], signals['smart_status']
     col1, col2 = st.columns(2)
     col1.metric("Smart Money Score", f"{smart_score}/4")
     col2.metric("Status", smart_status)
@@ -927,7 +1076,7 @@ with tab2:
         st.info("Sideways / Neutral")
 
     st.subheader("🌍 Macro Market Filter")
-    macro_status, macro_score = all_signals['macro_status'], all_signals['macro_score']
+    macro_status, macro_score = signals['macro_status'], signals['macro_score']
     col1, col2 = st.columns(2)
     col1.metric("Macro Condition", macro_status)
     col2.metric("Score", f"{macro_score}/3")
@@ -939,14 +1088,14 @@ with tab2:
         st.info("Market Neutral")
 
     st.subheader("🔄 Sector Rotation")
-    best_sector = all_signals['best_sector']
+    best_sector = signals['best_sector']
     st.metric("Leading Sector", best_sector)
     _, sector_data = get_sector_rotation()
     for sector, val in sector_data.items():
         st.write(f"{sector}: {val:.2%}")
 
     st.subheader("🎯 Final AI Confidence")
-    confidence = all_signals['confidence']
+    confidence = signals['confidence']
     st.metric("Confidence Score", f"{confidence}%")
     if confidence >= 75:
         st.success("🚀 High Probability Trade")
@@ -1092,7 +1241,7 @@ with tab5:
     else:
         st.warning(f"Data tidak cukup untuk backtest. Minimal 50 baris, saat ini {len(data)} baris.")
     if IS_CLOUD:
-        st.info("💡 **Mode Cloud:** ML aktif, News nonaktif untuk performa optimal.")
+        st.info("💡 **Mode Cloud:** ML global nonaktif, ensemble tetap jalan dengan model per ticker.")
 
 # ========== TAB 6: INFO ==========
 with tab6:
@@ -1128,12 +1277,13 @@ with tab6:
         **Risk Reward Ratio**: Target/risk > 2 = good setup  
         **Rule AI Score** 4-5: Strong Buy, 3: Hold, 0-2: Sell  
         **ML AI Score**: Probabilitas harga naik dalam 5 hari (RandomForest)  
+        **Ensemble Score**: Gabungan ML (60%) + Rule (40%)  
         **FINAL DECISION** rule score ≥3: Accumulate, =2: Wait, ≤1: Avoid
         **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly
         **Smart Money**: Akumulasi jika CMF>0, AD naik, volume spike, price>MA20
         **Macro**: Risk ON jika IHSG naik, USD turun, Nasdaq naik
         **Sector Rotation**: Sektor dengan performa 5 hari terbaik
-        **Final Confidence**: Gabungan rule AI score + Smart Money + Macro + Sector
+        **Feature Importance**: Menunjukkan variabel paling berpengaruh dalam model ML global.
         """)
 
 # ========== TAB 7: SMART MONEY ==========
@@ -1162,7 +1312,7 @@ with tab7:
     else:
         st.warning("Data tidak cukup.")
 
-# ========== TAB 8: MACRO MARKET (GUNAKAN GLOBAL CACHE) ==========
+# ========== TAB 8: MACRO MARKET ==========
 with tab8:
     st.header("🌍 Macro Market Dashboard")
     st.markdown("Kondisi makro global untuk filter keputusan.")
@@ -1176,7 +1326,7 @@ with tab8:
     else:
         st.info("Netral.")
     try:
-        ihsg, usd, nasdaq = get_macro_data()
+        ihsg, usd, nasdaq = get_macro_data_async()
         st.subheader("Data Terkini")
         col1, col2, col3 = st.columns(3)
         col1.metric("IHSG", f"{safe_last(ihsg):.2f}", f"{((safe_last(ihsg)/ihsg.iloc[0])-1)*100:.2f}%")
