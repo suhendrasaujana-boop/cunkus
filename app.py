@@ -289,9 +289,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.ffill().fillna(0)
     return df
 
-# ========== RULE-BASED AI SCORE (RAW CONDITION COUNT) ==========
+# ========== RULE-BASED RAW SCORE (0-1) ==========
 def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
-    """Menghitung rule score dalam range 0-1 (berdasarkan jumlah kondisi terpenuhi)."""
     if df.empty:
         return 0
     rsi = safe_last(df['RSI'], 50)
@@ -311,7 +310,13 @@ def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
     ]
     return sum(conditions) / len(conditions)
 
-# ========== MACHINE LEARNING (SINGLE TICKER) UNTUK ML SCORE ==========
+# ========== RULE-BASED AI SCORE (0-5) UNTUK KOMPATIBILITAS ==========
+def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
+    """Legacy function: returns integer 0-5 based on rule conditions."""
+    raw = calculate_rule_score_raw(df, volume)
+    return int(round(raw * 5))
+
+# ========== MACHINE LEARNING (SINGLE TICKER) ==========
 def build_ml_features(df: pd.DataFrame, volume: pd.Series) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -355,10 +360,10 @@ def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int =
     if model is None:
         return 0.5
     latest = features.iloc[-1:].fillna(0)
-    prob = model.predict_proba(latest)[0][1]  # probability of up
+    prob = model.predict_proba(latest)[0][1]
     return prob
 
-# ========== MULTI-TICKER GLOBAL ML (UNTUK ENSEMBLE) ==========
+# ========== MULTI-TICKER GLOBAL ML ==========
 @st.cache_data(ttl=3600)
 def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
     all_dfs = []
@@ -405,7 +410,6 @@ def train_global_model(tickers: List[str]):
     return model, feature_cols
 
 def get_global_ml_probability(ticker_df: pd.DataFrame, volume: pd.Series, global_model, feature_names) -> float:
-    """Return probability from global model (0-1)."""
     if global_model is None or not feature_names:
         return 0.5
     features = pd.DataFrame(index=ticker_df.index)
@@ -441,7 +445,28 @@ def calculate_smart_money_score_normalized(df):
         score += 1
     return score / 4.0
 
-# ========== MACRO SCORE (NORMALIZED 0-1) ==========
+def calculate_smart_money(df):
+    """Legacy function: returns (score 0-4, status)"""
+    if df.empty or len(df) < 20:
+        return 0, "Neutral"
+    score = 0
+    if safe_last(df['CMF']) > 0:
+        score += 1
+    if len(df) >= 5 and safe_last(df['AD']) > df['AD'].iloc[-5]:
+        score += 1
+    if has_volume(df['Volume']) and safe_last(df['Volume']) > safe_last(df['Volume_MA']) * 1.5:
+        score += 1
+    if safe_last(df['Close']) > safe_last(df['SMA20']):
+        score += 1
+    if score >= 3:
+        status = "Accumulation"
+    elif score == 2:
+        status = "Neutral"
+    else:
+        status = "Distribution"
+    return score, status
+
+# ========== MACRO SCORE ==========
 def get_macro_score_normalized():
     macro_status, _ = get_macro_signal()
     if macro_status == "Risk ON":
@@ -610,27 +635,6 @@ def get_multi_timeframe_trend(ticker):
         "Monthly": trend(monthly)
     }
 
-def calculate_smart_money(df):
-    """Legacy function untuk smart money score 0-4 dan status."""
-    if df.empty or len(df) < 20:
-        return 0, "Neutral"
-    score = 0
-    if safe_last(df['CMF']) > 0:
-        score += 1
-    if len(df) >= 5 and safe_last(df['AD']) > df['AD'].iloc[-5]:
-        score += 1
-    if has_volume(df['Volume']) and safe_last(df['Volume']) > safe_last(df['Volume_MA']) * 1.5:
-        score += 1
-    if safe_last(df['Close']) > safe_last(df['SMA20']):
-        score += 1
-    if score >= 3:
-        status = "Accumulation"
-    elif score == 2:
-        status = "Neutral"
-    else:
-        status = "Distribution"
-    return score, status
-
 def get_all_signals(df, volume, ticker):
     ai_score = calculate_ai_score(df, volume)  # rule score 0-5
     smart_score, smart_status = calculate_smart_money(df)
@@ -711,7 +715,6 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     rule_score = calculate_rule_score_raw(df, volume)
     
     # 2. ML score (0-1)
-    # Coba gunakan global model terlebih dahulu jika tersedia
     if st.session_state.global_ml_model is not None:
         ml_prob = get_global_ml_probability(df, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
     else:
