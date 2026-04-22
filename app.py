@@ -316,6 +316,23 @@ def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
     raw = calculate_rule_score_raw(df, volume)
     return int(round(raw * 5))
 
+# ========== MOMENTUM REWARD SIGNAL (0-1) ==========
+def momentum_reward_score(df: pd.DataFrame, lookback: int = 20) -> float:
+    """
+    Menghitung skor reward berdasarkan historical return.
+    Semakin positif reward, semakin besar kecenderungan bullish.
+    Hasil dalam range 0-1.
+    """
+    if df.empty or len(df) < lookback:
+        return 0.5
+    returns = df['Close'].pct_change().dropna()
+    if len(returns) < lookback:
+        return 0.5
+    recent_returns = returns.iloc[-lookback:]
+    reward = (recent_returns > 0).sum() / len(recent_returns)  # proporsi hari naik
+    # Normalisasi ke 0-1: reward 0.5 -> 0.5, reward 1 -> 1, reward 0 -> 0
+    return float(reward)
+
 # ========== MACHINE LEARNING (SINGLE TICKER) ==========
 def build_ml_features(df: pd.DataFrame, volume: pd.Series) -> pd.DataFrame:
     if df.empty:
@@ -702,14 +719,15 @@ def weighted_decision_engine(df, volume, ticker):
     )
     return round(final_score * 100, 2)
 
-# ========== NEW ENSEMBLE AI SCORE (STEP 3) ==========
+# ========== NEW ENSEMBLE AI SCORE (DENGAN MOMENTUM REWARD) ==========
 def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple[float, Dict]:
     """
     Menghitung final ensemble score (0-100) berdasarkan:
-    - Rule engine (30%)
-    - ML model (30%) - prioritas global model jika ada, else single ticker
+    - Rule engine (25%)
+    - ML model (25%)
     - Smart money (20%)
     - Macro (20%)
+    - Momentum Reward (10%)
     """
     # 1. Rule score (0-1)
     rule_score = calculate_rule_score_raw(df, volume)
@@ -726,20 +744,25 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     # 4. Macro score (0-1)
     macro_score = get_macro_score_normalized()
     
-    # Bobot
-    w_rule, w_ml, w_smart, w_macro = 0.30, 0.30, 0.20, 0.20
-    final = (w_rule * rule_score + w_ml * ml_prob + w_smart * smart_score + w_macro * macro_score) * 100
+    # 5. Momentum reward score (0-1) - berdasarkan proporsi hari naik dalam 20 hari terakhir
+    reward_score = momentum_reward_score(df, lookback=20)
+    
+    # Bobot baru: 25%, 25%, 20%, 20%, 10%
+    w_rule, w_ml, w_smart, w_macro, w_reward = 0.25, 0.25, 0.20, 0.20, 0.10
+    final = (w_rule * rule_score + w_ml * ml_prob + w_smart * smart_score + 
+             w_macro * macro_score + w_reward * reward_score) * 100
     final = np.clip(final, 0, 100)
     
     breakdown = {
         "rule": rule_score * 100,
         "ml": ml_prob * 100,
         "smart": smart_score * 100,
-        "macro": macro_score * 100
+        "macro": macro_score * 100,
+        "reward": reward_score * 100
     }
     return final, breakdown
 
-# ========== PORTFOLIO OPTIMIZER FUNCTIONS ==========
+# ========== PORTFOLIO OPTIMIZER FUNCTIONS (MARKOWITZ) ==========
 def get_portfolio_returns(tickers, period="1y"):
     data = yf.download(tickers, period=period, interval="1d", progress=False, auto_adjust=False)['Close']
     if data.empty:
@@ -898,9 +921,9 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
 
-# ========== TAB 2: AI SIGNAL (DENGAN ENSEMBLE BRAIN) ==========
+# ========== TAB 2: AI SIGNAL (DENGAN ENSEMBLE + REWARD) ==========
 with tab2:
-    # Hitung ensemble score
+    # Hitung ensemble score (termasuk reward)
     final_score, breakdown = ensemble_ai_score(data, volume, ticker)
     
     st.subheader("🧠 ENSEMBLE TRADING BRAIN")
@@ -918,28 +941,29 @@ with tab2:
         st.error("🔻 SELL / AVOID")
         signal = "SELL / AVOID"
     
-    st.caption("Ensemble menggabungkan Rule Engine (30%), ML Model (30%), Smart Money (20%), Macro (20%)")
+    st.caption("Ensemble: Rule (25%) + ML (25%) + Smart Money (20%) + Macro (20%) + Momentum Reward (10%)")
     st.divider()
     
-    # Breakdown
+    # Breakdown (5 komponen)
     st.subheader("🧩 Ensemble Breakdown")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Rule Engine", f"{breakdown['rule']:.1f}%")
     col2.metric("ML Model", f"{breakdown['ml']:.1f}%")
     col3.metric("Smart Money", f"{breakdown['smart']:.1f}%")
     macro_status, _ = get_macro_signal()
     col4.metric("Macro", macro_status, delta=f"{breakdown['macro']:.1f}%")
+    col5.metric("Momentum Reward", f"{breakdown['reward']:.1f}%")
     
-    # Detail
     with st.expander("Lihat Detail Komponen"):
         st.write("**Rule Engine:** RSI < 35, Close > SMA20, SMA20 > SMA50, MACD > Signal, Volume > MA")
         st.write("**ML Model:** RandomForest (probabilitas naik 5 hari ke depan)")
         st.write("**Smart Money:** CMF, AD trend, volume spike, price vs SMA20")
         st.write("**Macro:** IHSG trend, USD/IDR, Nasdaq")
+        st.write("**Momentum Reward:** Proporsi hari naik dalam 20 hari terakhir (reward-based)")
     
     st.divider()
     
-    # Risk Meter
+    # Risk Meter (sama seperti sebelumnya)
     st.subheader("🎯 Risk Meter")
     returns = data['Close'].pct_change().dropna()
     if len(returns) > 0:
@@ -1248,7 +1272,7 @@ with tab4:
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
     
-    # Portfolio Optimizer
+    # Portfolio Optimizer (Markowitz)
     st.divider()
     st.subheader("📊 Portfolio Optimizer (Markowitz)")
     st.markdown("Optimasi alokasi portofolio berdasarkan **mean-variance optimization** (Sharpe ratio maksimum).")
@@ -1369,11 +1393,12 @@ with tab6:
         **AD > 0**: Akumulasi (tekanan beli)  
         **CMF > 0**: Tekanan beli  
         **Risk Reward Ratio**: Target/risk > 2 = good setup  
-        **Ensemble AI Score**: Gabungan Rule (30%), ML (30%), Smart Money (20%), Macro (20%)  
+        **Ensemble AI Score**: Gabungan Rule (25%), ML (25%), Smart Money (20%), Macro (20%), Momentum Reward (10%)  
         **Rule Engine**: 5 kondisi teknikal klasik  
         **ML Model**: RandomForest yang dilatih dari data IHSG (global atau per ticker)  
         **Smart Money**: Deteksi akumulasi/distribusi institusi  
         **Macro Filter**: Risk ON/OFF berdasarkan IHSG, USD/IDR, Nasdaq  
+        **Momentum Reward**: Proporsi hari naik dalam 20 hari terakhir (reward-based signal)  
         **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly  
         **Portfolio Optimizer**: Mean-variance optimization untuk alokasi aset optimal
         """)
