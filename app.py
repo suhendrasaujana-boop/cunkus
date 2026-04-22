@@ -9,17 +9,22 @@ import time
 import random
 from typing import Dict, List, Optional, Tuple, Any
 from plotly.subplots import make_subplots
+import os
+import gc
+
+# ========== DETEKSI ENVIRONMENT ==========
+IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
 
 # ========== IMPORT OPSIONAL DENGAN PENANGANAN ERROR ==========
 try:
     import feedparser
-    FEEDPARSER_AVAILABLE = True
+    FEEDPARSER_AVAILABLE = False if IS_CLOUD else True
 except ImportError:
     FEEDPARSER_AVAILABLE = False
 
 try:
     from textblob import TextBlob
-    TEXTBLOB_AVAILABLE = True
+    TEXTBLOB_AVAILABLE = False if IS_CLOUD else True
 except ImportError:
     TEXTBLOB_AVAILABLE = False
 
@@ -27,15 +32,25 @@ try:
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import accuracy_score
-    SKLEARN_AVAILABLE = True
+    SKLEARN_AVAILABLE = False if IS_CLOUD else True
 except ImportError:
     SKLEARN_AVAILABLE = False
 
-# ========== KONSTANTA ==========
+# ========== KONSTANTA OPTIMASI ==========
+if IS_CLOUD:
+    DATA_PERIOD = "6mo"
+    MAX_CHART_POINTS = 150
+    CACHE_TTL = 300
+    SCANNER_CACHE_TTL = 900
+    st.warning("☁️ **Mode Cloud Aktif** - Optimasi untuk performa terbaik. Fitur utama 100% berjalan!")
+else:
+    DATA_PERIOD = "2y"
+    MAX_CHART_POINTS = 500
+    CACHE_TTL = 600
+    SCANNER_CACHE_TTL = 1800
+
 TIMEFRAMES = {"1d": "1d", "1wk": "1wk", "1mo": "1mo"}
 DEFAULT_TICKER = "^JKSE"
-CACHE_TTL = 600
-SCANNER_CACHE_TTL = 1800
 IHSG_BLUE_CHIPS = [
     "BBRI.JK", "BBCA.JK", "BMRI.JK", "TLKM.JK", "ASII.JK",
     "ADRO.JK", "ANTM.JK", "MDKA.JK", "UNTR.JK", "ICBP.JK",
@@ -45,7 +60,16 @@ VOLUME_SPIKE_THRESHOLD = 1.8
 BREAKOUT_COOLDOWN_HOURS = 24
 VOLUME_SPIKE_COOLDOWN_HOURS = 6
 
-st.set_page_config(layout="wide", page_title="Smart Market Dashboard", page_icon="📊")
+st.set_page_config(
+    layout="wide", 
+    page_title="Smart Market Dashboard", 
+    page_icon="📊",
+    menu_items={
+        'Get Help': None,
+        'Report a bug': None,
+        'About': None
+    }
+)
 
 # ========== SESSION STATE ==========
 if 'last_resistance' not in st.session_state:
@@ -130,16 +154,21 @@ def get_fundamental_details(ticker: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-@st.cache_data(ttl=CACHE_TTL)
+@st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
     try:
-        df = yf.download(ticker, period="2y", interval=timeframe, progress=False, auto_adjust=False)
+        df = yf.download(ticker, period=DATA_PERIOD, interval=timeframe, progress=False, auto_adjust=False)
         if df.empty:
-            df = yf.download(ticker, period="1y", interval=timeframe, progress=False, auto_adjust=False)
+            df = yf.download(ticker, period="3mo", interval=timeframe, progress=False, auto_adjust=False)
         if df.empty or len(df) < 2:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        
+        # Batasi data points
+        if len(df) > MAX_CHART_POINTS * 2:
+            df = df.tail(MAX_CHART_POINTS * 2)
+        
         df = df.dropna(how='all')
         if 'Volume' in df.columns:
             df['Volume'] = df['Volume'].fillna(0)
@@ -152,25 +181,20 @@ def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
 def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
     try:
         time.sleep(random.uniform(0.3, 0.8))
-        all_data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker", progress=False, threads=True, auto_adjust=False)
+        all_data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker", progress=False, threads=True)
+        
         rows = []
         for ticker in tickers:
             try:
-                if isinstance(all_data.columns, pd.MultiIndex):
-                    if ticker not in all_data.columns.levels[0]:
-                        continue
-                    df = all_data[ticker].dropna()
-                else:
-                    if ticker != all_data.columns.get_level_values(0)[0]:
-                        continue
-                    df = all_data.dropna()
+                if ticker not in all_data.columns.levels[0]:
+                    continue
+                df = all_data[ticker].copy()
+                df = df.dropna()
                 if len(df) < 20:
                     continue
                 close = df['Close']
                 rsi = ta.momentum.rsi(close, window=14).iloc[-1] if len(close) >= 14 else 50
                 sma20 = close.rolling(20).mean().iloc[-1]
-                if pd.isna(sma20):
-                    sma20 = close.iloc[-1]
                 score_val = (1 if rsi < 35 else 0) + (1 if close.iloc[-1] > sma20 else 0)
                 rows.append([ticker, round(rsi, 2), score_val])
             except Exception:
@@ -184,7 +208,13 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     close = df['Close']
-    volume = df['Volume'] if 'Volume' in df.columns else pd.Series(0, index=df.index)
+    
+    # Handle volume
+    if 'Volume' in df.columns and df['Volume'].sum() > 0:
+        volume = df['Volume']
+    else:
+        volume = pd.Series(0, index=df.index)
+        df['Volume'] = 0
 
     df['SMA20'] = safe_sma(close, 20)
     df['SMA50'] = safe_sma(close, 50)
@@ -211,11 +241,18 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['resistance'] = df['High'].rolling(20, min_periods=1).max()
 
     try:
-        df['AD'] = ta.volume.acc_dist_index(df['High'], df['Low'], df['Close'], df['Volume'], fillna=True)
+        if volume.sum() > 0:
+            df['AD'] = ta.volume.acc_dist_index(df['High'], df['Low'], df['Close'], df['Volume'], fillna=True)
+        else:
+            df['AD'] = 0.0
     except Exception:
         df['AD'] = 0.0
+    
     try:
-        df['CMF'] = ta.volume.chaikin_money_flow(df['High'], df['Low'], df['Close'], df['Volume'], window=20, fillna=True)
+        if volume.sum() > 0:
+            df['CMF'] = ta.volume.chaikin_money_flow(df['High'], df['Low'], df['Close'], df['Volume'], window=20, fillna=True)
+        else:
+            df['CMF'] = 0.0
     except Exception:
         df['CMF'] = 0.0
 
@@ -270,6 +307,8 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
     df = df.copy()
     df['sma'] = df['Close'].rolling(sma_period).mean()
     df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
+    df['sma'] = df['sma'].fillna(df['Close'])
+    df['rsi'] = df['rsi'].fillna(50)
     df['buy_signal'] = (df['rsi'] < rsi_buy) & (df['Close'] > df['sma'])
     df['sell_signal'] = (df['rsi'] > rsi_sell) | (df['Close'] < df['sma'])
     
@@ -305,37 +344,8 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
         'bh_return': bh_return
     }
 
-def prepare_ml_features(df, lookback=5, target_pct=0.01):
-    if not SKLEARN_AVAILABLE:
-        return None, None
-    if df.empty or len(df) < 100:
-        return None, None
-    df = df.copy()
-    df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
-    df['sma20'] = df['Close'].rolling(20).mean()
-    df['sma50'] = df['Close'].rolling(50).mean()
-    df['volume_ma'] = df['Volume'].rolling(20).mean()
-    df['ad'] = ta.volume.acc_dist_index(df['High'], df['Low'], df['Close'], df['Volume'], fillna=True)
-    df['cmf'] = ta.volume.chaikin_money_flow(df['High'], df['Low'], df['Close'], df['Volume'], window=20, fillna=True)
-    df['momentum_5'] = df['Close'].pct_change(5)
-    df['volume_change'] = df['Volume'] / df['Volume'].rolling(20).mean() - 1
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr'] = tr.rolling(14).mean()
-    df['future_return'] = df['Close'].shift(-lookback) / df['Close'] - 1
-    df['target'] = (df['future_return'] > target_pct).astype(int)
-    df = df.dropna()
-    if len(df) < 50:
-        return None, None
-    features = ['rsi', 'sma20', 'sma50', 'volume_ma', 'ad', 'cmf', 'momentum_5', 'volume_change', 'atr']
-    X = df[features]
-    y = df['target']
-    return X, y
-
 def get_news_sentiment():
-    if not (FEEDPARSER_AVAILABLE and TEXTBLOB_AVAILABLE):
+    if IS_CLOUD or not (FEEDPARSER_AVAILABLE and TEXTBLOB_AVAILABLE):
         return None
     try:
         feed = feedparser.parse('https://www.cnbcindonesia.com/news/rss')
@@ -357,7 +367,7 @@ def get_multi_timeframe_trend(ticker):
     monthly = load_data(ticker, "1mo")
 
     def trend(df):
-        if df is None or len(df) < 20:
+        if df.empty or len(df) < 20:
             return "Neutral"
         close = df["Close"]
         sma20 = close.rolling(20).mean()
@@ -382,7 +392,7 @@ def calculate_smart_money(df):
         score += 1
     if df['AD'].iloc[-1] > df['AD'].iloc[-5]:
         score += 1
-    if df['Volume'].iloc[-1] > df['Volume_MA'].iloc[-1] * 1.5:
+    if df['Volume'].iloc[-1] > df['Volume_MA'].iloc[-1] * 1.5 and df['Volume'].iloc[-1] > 0:
         score += 1
     if df['Close'].iloc[-1] > df['SMA20'].iloc[-1]:
         score += 1
@@ -506,10 +516,8 @@ def get_all_signals(df, volume, ticker):
     
 def weighted_decision_engine(df, volume, ticker):
     signals = get_all_signals(df, volume, ticker)
-    # technical
     tech_score = signals['ai_score'] / 5
 
-    # smart money
     smart_map = {
         "Accumulation": 1,
         "Neutral": 0.5,
@@ -517,7 +525,6 @@ def weighted_decision_engine(df, volume, ticker):
     }
     smart_score = smart_map.get(signals['smart_status'], 0.5)
 
-    # macro
     macro_map = {
         "Risk ON": 1,
         "Neutral": 0.5,
@@ -525,10 +532,8 @@ def weighted_decision_engine(df, volume, ticker):
     }
     macro_score = macro_map.get(signals['macro_status'], 0.5)
 
-    # sector
     sector_score = 1 if ticker.replace(".JK","") in signals['best_sector'] else 0.5
 
-    # risk
     returns = df['Close'].pct_change().dropna()
     vol = returns.std() * np.sqrt(252)
     if vol < 0.15:
@@ -538,7 +543,6 @@ def weighted_decision_engine(df, volume, ticker):
     else:
         risk_score = 0.2
 
-    # momentum
     momentum = df['Close'].pct_change(5).iloc[-1]
     if momentum > 0.05:
         momentum_score = 1
@@ -581,7 +585,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     st.markdown("---")
-    st.caption("Data dari Yahoo Finance | Update 10 menit")
+    st.caption("Data dari Yahoo Finance | Update 5 menit")
 
 # ========== LOAD DATA ==========
 with st.spinner("Memuat data..."):
@@ -593,6 +597,7 @@ if data.empty or len(data) < 5:
 
 data = add_indicators(data)
 
+# Alert Check
 if not data.empty:
     current_resistance = data['resistance'].iloc[-1]
     current_price = data['Close'].iloc[-1]
@@ -643,66 +648,65 @@ st.markdown("---")
 # ========== TABS ==========
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📈 Grafik", "🤖 AI Signal", "🔍 Scanner", "📁 Portfolio",
-    "🧪 Backtest & ML", "📖 Info", "🏦 Smart Money", "🌍 Macro Market", "🔄 Sector Flow"
+    "🧪 Backtest", "📖 Info", "🏦 Smart Money", "🌍 Macro Market", "🔄 Sector Flow"
 ])
 
-# ========== TAB 1: GRAFIK ==========
+# ========== TAB 1: GRAFIK (RINGKAS UNTUK CLOUD) ==========
 with tab1:
     st.subheader("Candlestick Chart dengan Volume")
+    
+    # Batasi data untuk chart
+    chart_data = data.tail(MAX_CHART_POINTS) if len(data) > MAX_CHART_POINTS else data
+    
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
                         row_heights=[0.7, 0.3])
     
-    fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'],
-                                 low=data['Low'], close=data['Close'], name="Price",
-                                 hovertemplate='Tanggal: %{x}<br>Open: %{open:.2f}<br>High: %{high:.2f}<br>Low: %{low:.2f}<br>Close: %{close:.2f}<extra></extra>'),
+    fig.add_trace(go.Candlestick(x=chart_data.index, open=chart_data['Open'], high=chart_data['High'],
+                                 low=chart_data['Low'], close=chart_data['Close'], name="Price",
+                                 showlegend=False),
                   row=1, col=1)
     
-    fig.add_trace(go.Scatter(x=data.index, y=data['SMA20'], name="SMA20",
-                             hovertemplate='SMA20: %{y:.2f}<extra></extra>'),
+    fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['SMA20'], name="SMA20",
+                             line=dict(width=1), showlegend=True),
                   row=1, col=1)
-    fig.add_trace(go.Scatter(x=data.index, y=data['SMA50'], name="SMA50",
-                             hovertemplate='SMA50: %{y:.2f}<extra></extra>'),
+    fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['SMA50'], name="SMA50",
+                             line=dict(width=1), showlegend=True),
                   row=1, col=1)
-    fig.add_trace(go.Scatter(x=data.index, y=data['support'], name="Support", line=dict(dash='dash'),
-                             hovertemplate='Support: %{y:.2f}<extra></extra>'),
+    fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['support'], name="Support", 
+                             line=dict(dash='dash', width=1), showlegend=True),
                   row=1, col=1)
-    fig.add_trace(go.Scatter(x=data.index, y=data['resistance'], name="Resistance", line=dict(dash='dash'),
-                             hovertemplate='Resistance: %{y:.2f}<extra></extra>'),
+    fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data['resistance'], name="Resistance", 
+                             line=dict(dash='dash', width=1), showlegend=True),
                   row=1, col=1)
-    if 'BB_upper' in data.columns and not data['BB_upper'].isnull().all():
-        fig.add_trace(go.Scatter(x=data.index, y=data['BB_upper'], name="BB Upper", line=dict(dash='dot'),
-                                 hovertemplate='BB Upper: %{y:.2f}<extra></extra>'),
-                      row=1, col=1)
-        fig.add_trace(go.Scatter(x=data.index, y=data['BB_lower'], name="BB Lower", line=dict(dash='dot'),
-                                 hovertemplate='BB Lower: %{y:.2f}<extra></extra>'),
-                      row=1, col=1)
     
-    fig.add_trace(go.Bar(x=data.index, y=volume, name="Volume", marker_color='lightblue',
-                         hovertemplate='Volume: %{y:,.0f}<extra></extra>'),
+    vol_data = chart_data['Volume'] if 'Volume' in chart_data.columns else pd.Series(0, index=chart_data.index)
+    fig.add_trace(go.Bar(x=chart_data.index, y=vol_data, name="Volume", marker_color='lightblue',
+                         showlegend=True),
                   row=2, col=1)
     
-    fig.update_layout(height=800, title_text=f"{ticker} - Candlestick & Volume", showlegend=True)
+    fig.update_layout(height=600, title_text=f"{ticker} - Candlestick & Volume", 
+                      showlegend=True, hovermode='x unified')
     fig.update_xaxes(title_text="Tanggal", row=2, col=1)
     fig.update_yaxes(title_text="Harga", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
     st.subheader("RSI (14) & MACD")
     col_r, col_m = st.columns(2)
     with col_r:
-        st.line_chart(data['RSI'])
+        st.line_chart(data['RSI'].tail(100))
         st.caption("RSI < 35: Oversold | >70: Overbought")
     with col_m:
-        st.line_chart(data[['MACD', 'MACD_signal']])
+        st.line_chart(data[['MACD', 'MACD_signal']].tail(100))
         st.caption("MACD > Signal: Bullish")
 
     st.subheader("AD & CMF")
     col_ad, col_cmf = st.columns(2)
     with col_ad:
-        st.line_chart(data['AD'])
+        st.line_chart(data['AD'].tail(100))
     with col_cmf:
-        st.line_chart(data['CMF'])
+        st.line_chart(data['CMF'].tail(100))
 
 # ========== TAB 2: AI SIGNAL ==========
 with tab2:
@@ -950,12 +954,17 @@ with tab2:
     else:
         st.error("🔻 AVOID")
 
-# ========== TAB 3: SCANNER ==========
+# ========== TAB 3: SCANNER (MANUAL REFRESH) ==========
 with tab3:
     st.subheader("🔥 SUPER FAST IHSG SCANNER (15 Blue Chip)")
-    with st.spinner("Memindai 15 saham..."):
-        scan_df = scan_market_fast(IHSG_BLUE_CHIPS)
-    if not scan_df.empty:
+    
+    if st.button("🔍 Scan Sekarang", use_container_width=True, type="primary"):
+        with st.spinner("Memindai 15 saham..."):
+            scan_df = scan_market_fast(IHSG_BLUE_CHIPS)
+            st.session_state.scan_result = scan_df
+    
+    if 'scan_result' in st.session_state and not st.session_state.scan_result.empty:
+        scan_df = st.session_state.scan_result
         st.dataframe(scan_df.sort_values("Score", ascending=False), use_container_width=True)
         st.subheader("🚀 TOP 5 BUY")
         top5 = scan_df.sort_values("Score", ascending=False).head(5)
@@ -964,7 +973,7 @@ with tab3:
         else:
             st.info("Tidak ada saham dengan score > 0")
     else:
-        st.warning("Scanner gagal, coba lagi nanti.")
+        st.info("Klik tombol 'Scan Sekarang' untuk memindai saham")
 
 # ========== TAB 4: PORTFOLIO ==========
 with tab4:
@@ -991,6 +1000,7 @@ with tab4:
                 st.rerun()
             else:
                 st.error("Isi semua field dengan benar.")
+    
     if st.session_state.portfolio:
         portfolio_df = pd.DataFrame(st.session_state.portfolio)
         unique_tickers = portfolio_df['ticker'].unique().tolist()
@@ -998,14 +1008,17 @@ with tab4:
         portfolio_df['current_price'] = portfolio_df['ticker'].map(current_prices)
         portfolio_df['unrealized_pnl'] = (portfolio_df['current_price'] - portfolio_df['entry_price']) * portfolio_df['shares']
         portfolio_df['pnl_pct'] = ((portfolio_df['current_price'] - portfolio_df['entry_price']) / portfolio_df['entry_price']) * 100
+        
         st.dataframe(portfolio_df, use_container_width=True)
         total_pnl = portfolio_df['unrealized_pnl'].sum()
         st.metric("Total Unrealized P&L", f"{total_pnl:,.2f}", delta=f"{total_pnl:+,.2f}")
+        
         if st.button("Hapus Semua Posisi"):
             st.session_state.portfolio = []
             st.rerun()
     else:
         st.info("Belum ada posisi. Gunakan form di atas untuk menambahkan.")
+    
     st.divider()
     st.subheader("📐 Position Sizing Calculator")
     col_cap, col_risk, col_sl = st.columns(3)
@@ -1030,12 +1043,12 @@ with tab4:
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
 
-# ========== TAB 5: BACKTEST & ML ==========
+# ========== TAB 5: BACKTEST (RINGKAS UNTUK CLOUD) ==========
 with tab5:
-    st.header("🧪 Backtesting & Machine Learning")
+    st.header("🧪 Backtesting Strategi")
     
     if volume.sum() == 0:
-        st.warning("Data volume tidak tersedia – backtest dan ML akan menggunakan fitur terbatas.")
+        st.info("Catatan: Data volume tidak tersedia untuk indeks")
     
     st.subheader("📈 Backtest Strategi (RSI + SMA)")
     col1, col2, col3 = st.columns(3)
@@ -1046,7 +1059,7 @@ with tab5:
     with col3:
         sma_period = st.slider("SMA Period", min_value=10, max_value=50, value=20, step=5)
     
-    commission = st.checkbox("Include Commission (0.1% per trade)", value=True)
+    commission = st.checkbox("Include Commission (0.1% per trade)", value=False)
     commission_rate = 0.001 if commission else 0
     
     with st.spinner("Menjalankan backtest..."):
@@ -1054,17 +1067,18 @@ with tab5:
     
     if bt_result:
         col_ret, col_trades, col_bh = st.columns(3)
-        col_ret.metric("Total Return", f"{bt_result['total_return']:.2f}%", delta=f"{bt_result['total_return']:.2f}%")
+        col_ret.metric("Total Return", f"{bt_result['total_return']:.2f}%")
         col_trades.metric("Jumlah Transaksi", bt_result['num_trades'])
-        col_bh.metric("Buy & Hold Return", f"{bt_result['bh_return']:.2f}%", delta=f"{bt_result['bh_return']:.2f}%")
+        col_bh.metric("Buy & Hold Return", f"{bt_result['bh_return']:.2f}%")
         st.write(f"**Modal Akhir:** Rp {bt_result['final_capital']:,.2f}")
         
-        st.subheader("📈 Equity Curve")
-        equity_df = pd.DataFrame({'Date': data.index[:len(bt_result['equity_curve'])], 'Equity': bt_result['equity_curve']})
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scatter(x=equity_df['Date'], y=equity_df['Equity'], mode='lines', name='Equity'))
-        fig_eq.update_layout(title="Pertumbuhan Modal", xaxis_title="Tanggal", yaxis_title="Nilai (Rp)")
-        st.plotly_chart(fig_eq, use_container_width=True)
+        if not IS_CLOUD and len(bt_result['equity_curve']) > 0:
+            st.subheader("📈 Equity Curve")
+            equity_df = pd.DataFrame({'Date': data.index[:len(bt_result['equity_curve'])], 'Equity': bt_result['equity_curve']})
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(x=equity_df['Date'], y=equity_df['Equity'], mode='lines', name='Equity'))
+            fig_eq.update_layout(title="Pertumbuhan Modal", xaxis_title="Tanggal", yaxis_title="Nilai (Rp)", height=400)
+            st.plotly_chart(fig_eq, use_container_width=True, config={'displayModeBar': False})
         
         with st.expander("Lihat Detail Transaksi"):
             if bt_result['trades']:
@@ -1074,75 +1088,8 @@ with tab5:
     else:
         st.warning(f"Data tidak cukup untuk backtest. Minimal 50 baris, saat ini {len(data)} baris.")
     
-    st.divider()
-    
-    st.subheader("🤖 Machine Learning Prediction (Walk-Forward Validation)")
-    
-    if SKLEARN_AVAILABLE:
-        lookback = st.slider("Prediction Horizon (hari)", min_value=1, max_value=10, value=5, step=1)
-        target_pct = st.slider("Target Return (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5) / 100.0
-        
-        X, y = prepare_ml_features(data, lookback=lookback, target_pct=target_pct)
-        
-        if X is not None and len(X) > 100:
-            window_size = 200
-            accuracies = []
-            last_model = None
-            for i in range(window_size, len(X) - 50, 50):
-                train_X = X.iloc[i-window_size:i]
-                train_y = y.iloc[i-window_size:i]
-                test_X = X.iloc[i:i+50]
-                test_y = y.iloc[i:i+50]
-                if len(train_X) < 100 or len(test_X) < 10:
-                    continue
-                model = RandomForestClassifier(n_estimators=100, random_state=42)
-                model.fit(train_X, train_y)
-                pred = model.predict(test_X)
-                acc = accuracy_score(test_y, pred)
-                accuracies.append(acc)
-                last_model = model
-            
-            avg_acc = np.mean(accuracies) if accuracies else 0
-            st.metric("Average Walk-Forward Accuracy", f"{avg_acc:.2%}")
-            st.caption("Akurasi rata-rata dari rolling window validasi.")
-            
-            if last_model is not None:
-                latest = X.iloc[-1:].values
-                prob = last_model.predict_proba(latest)[0][1]
-                st.metric(f"Probabilitas harga naik >{target_pct*100:.1f}% dalam {lookback} hari", f"{prob:.2%}")
-            else:
-                st.info("Belum ada model yang terbentuk, coba gunakan data yang lebih panjang.")
-            
-            if st.checkbox("Tampilkan Feature Importance") and last_model is not None:
-                importance = pd.DataFrame({'Feature': X.columns, 'Importance': last_model.feature_importances_})
-                st.bar_chart(importance.set_index('Feature'))
-        else:
-            if len(data) < 200:
-                st.warning(f"Data tidak cukup untuk ML. Minimal 200 baris, saat ini {len(data)} baris.")
-            else:
-                st.warning("Data tidak cukup setelah preprocessing. Pastikan volume tersedia (saham biasa, bukan indeks).")
-    else:
-        st.error("❌ Machine learning tidak tersedia karena library 'scikit-learn' tidak terinstal. Install dengan: pip install scikit-learn")
-    
-    st.divider()
-    
-    st.subheader("📰 Sentimen Berita (Diversifikasi)")
-    if FEEDPARSER_AVAILABLE and TEXTBLOB_AVAILABLE:
-        with st.spinner("Mengambil sentimen berita..."):
-            sentiment = get_news_sentiment()
-        if sentiment is not None:
-            sentiment_text = "Positif" if sentiment > 0 else "Negatif" if sentiment < 0 else "Netral"
-            st.metric("Sentimen 24 Jam", f"{sentiment_text} ({sentiment:.2f})")
-            st.caption("Sumber: CNBC Indonesia RSS (judul berita terbaru)")
-        else:
-            st.info("Tidak dapat mengambil sentimen berita saat ini. Cek koneksi internet atau RSS feed.")
-    else:
-        missing = []
-        if not FEEDPARSER_AVAILABLE:
-            missing.append("feedparser")
-        if not TEXTBLOB_AVAILABLE:
-            missing.append("textblob")
-        st.error(f"❌ Fitur sentimen tidak tersedia karena library {', '.join(missing)} tidak terinstal. Install dengan: pip install {' '.join(missing)}")
+    if IS_CLOUD:
+        st.info("💡 **Mode Cloud:** ML dan News dinonaktifkan untuk performa optimal. Gunakan AI Score untuk sinyal trading.")
 
 # ========== TAB 6: INFO ==========
 with tab6:
@@ -1168,18 +1115,6 @@ with tab6:
     else:
         st.info("Data fundamental tidak tersedia untuk indeks.")
     
-    st.divider()
-    
-    if FEEDPARSER_AVAILABLE and TEXTBLOB_AVAILABLE:
-        st.subheader("📰 Diversifikasi Sinyal: Sentimen Berita Terkini")
-        sentiment = get_news_sentiment()
-        if sentiment is not None:
-            sentiment_text = "Positif" if sentiment > 0 else "Negatif" if sentiment < 0 else "Netral"
-            st.metric("Sentimen 24 Jam", f"{sentiment_text} ({sentiment:.2f})")
-            st.caption("Sumber: CNBC Indonesia RSS (judul berita terbaru)")
-        else:
-            st.info("Tidak dapat mengambil sentimen saat ini.")
-    
     with st.expander("📖 Glossary (Klik untuk lihat)"):
         st.markdown("""
         **RSI** < 35: Oversold | >70: Overbought  
@@ -1191,8 +1126,6 @@ with tab6:
         **Risk Reward Ratio**: Target/risk > 2 = good setup  
         **AI Score** 4-5: Strong Buy, 3: Hold, 0-2: Sell  
         **FINAL DECISION** score ≥3: Accumulate, =2: Wait, ≤1: Avoid
-        **Backtest**: Menguji strategi RSI + SMA pada data historis, sekarang dengan parameter custom dan komisi
-        **Machine Learning**: Prediksi probabilitas kenaikan harga dengan fitur momentum, volume change, ATR dan validasi walk-forward
         **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly
         **Smart Money**: Akumulasi jika CMF>0, AD naik, volume spike, price>MA20
         **Macro**: Risk ON jika IHSG naik, USD turun, Nasdaq naik
@@ -1218,7 +1151,7 @@ with tab7:
         st.subheader("Komponen Score")
         cmf_ok = data['CMF'].iloc[-1] > 0
         ad_ok = data['AD'].iloc[-1] > data['AD'].iloc[-5]
-        vol_ok = data['Volume'].iloc[-1] > data['Volume_MA'].iloc[-1] * 1.5
+        vol_ok = data['Volume'].iloc[-1] > data['Volume_MA'].iloc[-1] * 1.5 if data['Volume'].iloc[-1] > 0 else False
         price_ok = data['Close'].iloc[-1] > data['SMA20'].iloc[-1]
         st.write(f"✅ CMF > 0: {cmf_ok}")
         st.write(f"✅ AD Naik (5 hari): {ad_ok}")
@@ -1269,3 +1202,6 @@ with tab9:
 # ========== FOOTER ==========
 st.markdown("---")
 st.caption("⚠️ **DISCLAIMER:** Dashboard ini hanya untuk edukasi dan analisis otomatis. Bukan rekomendasi beli/jual. Keputusan investasi sepenuhnya risiko Anda.")
+
+# Bersihkan memory
+gc.collect()
