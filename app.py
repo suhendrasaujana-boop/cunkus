@@ -13,14 +13,21 @@ import os
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ========== TAMBAHAN UNTUK PORTFOLIO OPTIMIZER ==========
+try:
+    from scipy.optimize import minimize
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 # ========== DETEKSI ENVIRONMENT ==========
 IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
 
 # ========== FITUR YANG DINONAKTIFKAN DI CLOUD ==========
-ENABLE_ML = True          # ML tetap jalan karena ringan
+ENABLE_ML = True
 ENABLE_NEWS = False if IS_CLOUD else True
 ENABLE_SENTIMENT = False if IS_CLOUD else True
-ENABLE_MULTI_TICKER_ML = not IS_CLOUD  # Multi-ticker training hanya di local (agak berat)
+ENABLE_MULTI_TICKER_ML = not IS_CLOUD
 
 # ========== IMPORT OPSIONAL ==========
 FEEDPARSER_AVAILABLE = False
@@ -118,7 +125,6 @@ def fix_ticker(ticker: str) -> str:
     return ticker + '.JK'
 
 def async_load_data(tasks: List) -> List:
-    """Jalankan beberapa fungsi secara paralel (ThreadPoolExecutor)."""
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(task) for task in tasks]
         results = [f.result() for f in futures]
@@ -351,10 +357,9 @@ def ml_ai_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5):
     score = int(prob * 100)
     return model, score
 
-# ========== MULTI-TICKER GLOBAL ML (UNTUK ENSEMBLE) ==========
-@st.cache_data(ttl=3600)  # cache 1 jam
+# ========== MULTI-TICKER GLOBAL ML ==========
+@st.cache_data(ttl=3600)
 def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
-    """Gabungkan data dari banyak saham untuk training global model."""
     all_dfs = []
     for t in tickers:
         try:
@@ -363,7 +368,6 @@ def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
                 continue
             df = df[['Open','High','Low','Close','Volume']].copy()
             df = df.dropna()
-            # Hitung indikator
             df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
             macd = ta.trend.MACD(df['Close'])
             df['MACD'] = macd.macd()
@@ -384,14 +388,12 @@ def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
     return combined
 
 def train_global_model(tickers: List[str]):
-    """Latih model global dari multi-ticker dataset."""
     if not SKLEARN_AVAILABLE:
         return None, []
     data = build_multi_ticker_dataset(tickers)
     if data.empty:
         return None, []
     feature_cols = ['RSI', 'MACD', 'MACD_signal', 'SMA20', 'SMA50', 'Volume', 'Volume_MA', 'return_5d', 'volatility']
-    # Pastikan kolom ada
     feature_cols = [c for c in feature_cols if c in data.columns]
     X = data[feature_cols].fillna(0)
     y = data['target']
@@ -402,10 +404,8 @@ def train_global_model(tickers: List[str]):
     return model, feature_cols
 
 def get_global_ml_score(ticker_df: pd.DataFrame, volume: pd.Series, global_model, feature_names):
-    """Gunakan global model untuk memprediksi satu ticker."""
     if global_model is None or not feature_names:
         return None
-    # Hitung fitur untuk ticker ini
     features = pd.DataFrame(index=ticker_df.index)
     features['RSI'] = ticker_df['RSI']
     features['MACD'] = ticker_df['MACD']
@@ -417,7 +417,6 @@ def get_global_ml_score(ticker_df: pd.DataFrame, volume: pd.Series, global_model
     features['return_5d'] = ticker_df['Close'].pct_change(5)
     features['volatility'] = ticker_df['Close'].pct_change().rolling(10).std()
     features = features.fillna(0)
-    # Pastikan hanya kolom yang dipakai model
     features = features[feature_names] if all(c in features.columns for c in feature_names) else pd.DataFrame()
     if features.empty:
         return None
@@ -427,8 +426,6 @@ def get_global_ml_score(ticker_df: pd.DataFrame, volume: pd.Series, global_model
 
 # ========== ENSEMBLE SCORE ==========
 def ensemble_score(ml_score: int, rule_score: int, ml_weight: float = 0.6, rule_weight: float = 0.4) -> int:
-    """Gabungkan ML score (0-100) dan rule score (0-100) menjadi final score."""
-    # Rule score dari calculate_ai_score (0-5) di-scale ke 0-100
     rule_scaled = rule_score * 20
     if ml_score is None:
         return rule_scaled
@@ -438,14 +435,12 @@ def ensemble_score(ml_score: int, rule_score: int, ml_weight: float = 0.6, rule_
 # ========== GLOBAL MACRO CACHE (ASYNC) ==========
 @st.cache_data(ttl=CACHE_TTL)
 def get_macro_data_async():
-    """Download macro data secara paralel."""
     def download_ihsg():
         return yf.download("^JKSE", period="5d", progress=False)['Close']
     def download_usd():
         return yf.download("USDIDR=X", period="5d", progress=False)['Close']
     def download_nasdaq():
         return yf.download("^IXIC", period="5d", progress=False)['Close']
-    
     ihsg, usd, nasdaq = async_load_data([download_ihsg, download_usd, download_nasdaq])
     return ihsg, usd, nasdaq
 
@@ -683,6 +678,33 @@ def weighted_decision_engine(df, volume, ticker):
     )
     return round(final_score * 100, 2)
 
+# ========== FUNGSI UNTUK PORTFOLIO OPTIMIZER ==========
+def get_portfolio_returns(tickers, period="1y"):
+    data = yf.download(tickers, period=period, interval="1d", progress=False, auto_adjust=False)['Close']
+    if data.empty:
+        return pd.DataFrame()
+    returns = data.pct_change().dropna()
+    return returns
+
+def portfolio_statistics(weights, returns, cov_matrix):
+    port_return = np.sum(returns.mean() * weights) * 252
+    port_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))
+    sharpe = port_return / port_vol if port_vol > 0 else 0
+    return port_return, port_vol, sharpe
+
+def negative_sharpe(weights, returns, cov_matrix):
+    _, _, sharpe = portfolio_statistics(weights, returns, cov_matrix)
+    return -sharpe
+
+def optimize_portfolio(returns):
+    n_assets = len(returns.columns)
+    init_weights = np.array([1/n_assets] * n_assets)
+    bounds = tuple((0, 1) for _ in range(n_assets))
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    result = minimize(negative_sharpe, init_weights, args=(returns, returns.cov()),
+                      method='SLSQP', bounds=bounds, constraints=constraints)
+    return result.x if result.success else init_weights
+
 # ========== SIDEBAR ==========
 with st.sidebar:
     st.markdown("# 📊 Smart Market Dashboard")
@@ -707,7 +729,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Data dari Yahoo Finance | Update 5 menit")
 
-# ========== TRAINING GLOBAL MODEL (jika di local) ==========
+# ========== TRAINING GLOBAL MODEL ==========
 if ENABLE_MULTI_TICKER_ML and SKLEARN_AVAILABLE and st.session_state.global_ml_model is None:
     with st.spinner("Melatih global AI model dari seluruh IHSG (sekali saja)..."):
         model, features = train_global_model(IHSG_BLUE_CHIPS)
@@ -815,17 +837,13 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
 
-# ========== TAB 2: AI SIGNAL (DENGAN ENSEMBLE & FEATURE IMPORTANCE) ==========
+# ========== TAB 2: AI SIGNAL ==========
 with tab2:
-    # Hitung rule score dan ml score
     rule_score = calculate_ai_score(data, volume)
-    # ML score dari model per ticker (single ticker)
     _, ml_score_single = ml_ai_score(data, volume, forward_days=5)
-    # ML score dari global model (jika ada)
     global_ml_score = None
     if st.session_state.global_ml_model is not None:
         global_ml_score = get_global_ml_score(data, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
-    # Ensemble: gunakan ML score terbaik (prioritas global jika ada, lalu single)
     ml_score_final = global_ml_score if global_ml_score is not None else ml_score_single
     final_ensemble = ensemble_score(ml_score_final, rule_score, ml_weight=0.6, rule_weight=0.4)
     
@@ -867,7 +885,6 @@ with tab2:
         else:
             st.info("ML tidak tersedia (data kurang)")
     
-    # Feature Importance (jika global model ada)
     if st.session_state.global_ml_model is not None and st.session_state.global_feature_names:
         st.subheader("🔥 Feature Importance (Global Model)")
         importances = st.session_state.global_ml_model.feature_importances_
@@ -878,7 +895,6 @@ with tab2:
         st.bar_chart(fi_df.set_index("Feature"))
         st.caption("Variabel yang paling mempengaruhi keputusan AI.")
     
-    # Risk Meter
     st.subheader("🎯 Risk Meter")
     returns = data['Close'].pct_change().dropna()
     if len(returns) > 0:
@@ -902,7 +918,6 @@ with tab2:
         risk = "HIGH"
         st.error(f"Risk Level: {risk} ({annual_vol:.1f}% annual)")
 
-    # Probability Engine (sama seperti sebelumnya)
     st.subheader("📊 Probability Engine")
     bull = bear = 0
     rsi = safe_last(data['RSI'], 50)
@@ -1135,7 +1150,7 @@ with tab3:
     else:
         st.info("Klik tombol 'Scan Sekarang' untuk memindai saham")
 
-# ========== TAB 4: PORTFOLIO ==========
+# ========== TAB 4: PORTFOLIO (DENGAN OPTIMIZER) ==========
 with tab4:
     st.subheader("📁 Portfolio Tracker")
     with st.expander("➕ Tambah Posisi Baru"):
@@ -1160,6 +1175,7 @@ with tab4:
                 st.rerun()
             else:
                 st.error("Isi semua field dengan benar.")
+    
     if st.session_state.portfolio:
         portfolio_df = pd.DataFrame(st.session_state.portfolio)
         unique_tickers = portfolio_df['ticker'].unique().tolist()
@@ -1179,6 +1195,7 @@ with tab4:
             st.rerun()
     else:
         st.info("Belum ada posisi. Gunakan form di atas untuk menambahkan.")
+    
     st.divider()
     st.subheader("📐 Position Sizing Calculator")
     col_cap, col_risk, col_sl = st.columns(3)
@@ -1202,6 +1219,61 @@ with tab4:
             st.warning("Stop loss harus di bawah harga saat ini.")
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
+
+    # ========== PORTFOLIO OPTIMIZER MARKOWITZ ==========
+    st.divider()
+    st.subheader("📊 Portfolio Optimizer (Markowitz)")
+    st.markdown("Optimasi alokasi portofolio berdasarkan **mean-variance optimization** (Sharpe ratio maksimum).")
+    
+    if not SCIPY_AVAILABLE:
+        st.warning("Library 'scipy' tidak tersedia. Optimizer tidak bisa berjalan. Silakan install scipy.")
+    else:
+        optimizer_mode = st.radio("Pilih aset untuk optimasi:", 
+                                   ("Gunakan saham dari portfolio", "Pilih saham sendiri"),
+                                   horizontal=True)
+        if optimizer_mode == "Gunakan saham dari portfolio":
+            if st.session_state.portfolio:
+                tickers_opt = list(set([p['ticker'] for p in st.session_state.portfolio]))
+                st.info(f"Optimasi untuk {len(tickers_opt)} saham: {', '.join(tickers_opt)}")
+            else:
+                st.warning("Portfolio kosong. Silakan tambah posisi atau pilih 'Pilih saham sendiri'.")
+                tickers_opt = []
+        else:
+            default_tickers = IHSG_BLUE_CHIPS[:5]
+            tickers_input = st.text_input("Masukkan ticker (pisahkan koma)", 
+                                          value=",".join(default_tickers),
+                                          help="Contoh: BBCA.JK,BBRI.JK,TLKM.JK")
+            tickers_opt = [fix_ticker(t.strip()) for t in tickers_input.split(",") if t.strip()]
+        
+        if tickers_opt and len(tickers_opt) >= 2:
+            period_opt = st.selectbox("Periode data untuk optimasi", ["1y", "2y", "6mo"], index=0)
+            with st.spinner("Menghitung optimasi portofolio..."):
+                returns = get_portfolio_returns(tickers_opt, period=period_opt)
+                if returns.empty or len(returns.columns) < 2:
+                    st.error("Data tidak cukup untuk optimasi. Coba periode lain atau periksa ticker.")
+                else:
+                    opt_weights = optimize_portfolio(returns)
+                    opt_return, opt_vol, opt_sharpe = portfolio_statistics(opt_weights, returns, returns.cov())
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Expected Annual Return", f"{opt_return*100:.2f}%")
+                    col2.metric("Expected Volatility", f"{opt_vol*100:.2f}%")
+                    col3.metric("Sharpe Ratio", f"{opt_sharpe:.3f}")
+                    
+                    weights_df = pd.DataFrame({
+                        "Saham": tickers_opt,
+                        "Bobot Optimal": opt_weights,
+                        "Bobot (%)": [f"{w*100:.1f}%" for w in opt_weights]
+                    }).sort_values("Bobot Optimal", ascending=False)
+                    st.dataframe(weights_df, use_container_width=True)
+                    
+                    fig_pie = go.Figure(data=[go.Pie(labels=tickers_opt, values=opt_weights, hole=0.4)])
+                    fig_pie.update_layout(title="Alokasi Optimal", height=400)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                    
+                    st.caption("Optimasi menggunakan metode Mean-Variance (Markowitz) dengan maksimasi Sharpe ratio. Asumsi risk-free rate = 0. Hasil hanya untuk edukasi.")
+        else:
+            st.info("Pilih minimal 2 saham untuk optimasi.")
 
 # ========== TAB 5: BACKTEST ==========
 with tab5:
@@ -1284,6 +1356,7 @@ with tab6:
         **Macro**: Risk ON jika IHSG naik, USD turun, Nasdaq naik
         **Sector Rotation**: Sektor dengan performa 5 hari terbaik
         **Feature Importance**: Menunjukkan variabel paling berpengaruh dalam model ML global.
+        **Portfolio Optimizer**: Mean-variance optimization untuk alokasi aset optimal.
         """)
 
 # ========== TAB 7: SMART MONEY ==========
