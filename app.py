@@ -289,8 +289,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.ffill().fillna(0)
     return df
 
-# ========== RULE-BASED AI SCORE ==========
-def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
+# ========== RULE-BASED AI SCORE (RAW CONDITION COUNT) ==========
+def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
+    """Menghitung rule score dalam range 0-1 (berdasarkan jumlah kondisi terpenuhi)."""
     if df.empty:
         return 0
     rsi = safe_last(df['RSI'], 50)
@@ -308,9 +309,9 @@ def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
         (macd > macd_signal) if not np.isnan(macd) and not np.isnan(macd_signal) else False,
         (vol > vol_ma) if has_volume(volume) else False
     ]
-    return sum(conditions)
+    return sum(conditions) / len(conditions)
 
-# ========== MACHINE LEARNING (SINGLE TICKER) ==========
+# ========== MACHINE LEARNING (SINGLE TICKER) UNTUK ML SCORE ==========
 def build_ml_features(df: pd.DataFrame, volume: pd.Series) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -338,26 +339,26 @@ def train_ml_model(features: pd.DataFrame, labels: pd.Series):
     model.fit(features, labels)
     return model
 
-def ml_ai_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5):
+def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5) -> float:
+    """Return ML probability in range 0-1."""
     if not SKLEARN_AVAILABLE or df.empty or len(df) < 60:
-        return None, 0
+        return 0.5
     features = build_ml_features(df, volume)
     labels = create_labels(df, forward_days)
     if len(features) < 50:
-        return None, 0
+        return 0.5
     train_features = features.iloc[:-forward_days]
     train_labels = labels.iloc[:-forward_days]
     if len(train_features) < 30:
-        return None, 0
+        return 0.5
     model = train_ml_model(train_features, train_labels)
     if model is None:
-        return None, 0
+        return 0.5
     latest = features.iloc[-1:].fillna(0)
-    prob = model.predict_proba(latest)[0][1]
-    score = int(prob * 100)
-    return model, score
+    prob = model.predict_proba(latest)[0][1]  # probability of up
+    return prob
 
-# ========== MULTI-TICKER GLOBAL ML ==========
+# ========== MULTI-TICKER GLOBAL ML (UNTUK ENSEMBLE) ==========
 @st.cache_data(ttl=3600)
 def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
     all_dfs = []
@@ -403,9 +404,10 @@ def train_global_model(tickers: List[str]):
     model.fit(X, y)
     return model, feature_cols
 
-def get_global_ml_score(ticker_df: pd.DataFrame, volume: pd.Series, global_model, feature_names):
+def get_global_ml_probability(ticker_df: pd.DataFrame, volume: pd.Series, global_model, feature_names) -> float:
+    """Return probability from global model (0-1)."""
     if global_model is None or not feature_names:
-        return None
+        return 0.5
     features = pd.DataFrame(index=ticker_df.index)
     features['RSI'] = ticker_df['RSI']
     features['MACD'] = ticker_df['MACD']
@@ -419,18 +421,35 @@ def get_global_ml_score(ticker_df: pd.DataFrame, volume: pd.Series, global_model
     features = features.fillna(0)
     features = features[feature_names] if all(c in features.columns for c in feature_names) else pd.DataFrame()
     if features.empty:
-        return None
+        return 0.5
     latest = features.iloc[-1:].fillna(0)
     prob = global_model.predict_proba(latest)[0][1]
-    return int(prob * 100)
+    return prob
 
-# ========== ENSEMBLE SCORE ==========
-def ensemble_score(ml_score: int, rule_score: int, ml_weight: float = 0.6, rule_weight: float = 0.4) -> int:
-    rule_scaled = rule_score * 20
-    if ml_score is None:
-        return rule_scaled
-    final = (ml_weight * ml_score) + (rule_weight * rule_scaled)
-    return int(np.clip(final, 0, 100))
+# ========== SMART MONEY SCORE (NORMALIZED 0-1) ==========
+def calculate_smart_money_score_normalized(df):
+    if df.empty or len(df) < 20:
+        return 0.5
+    score = 0
+    if safe_last(df['CMF']) > 0:
+        score += 1
+    if len(df) >= 5 and safe_last(df['AD']) > df['AD'].iloc[-5]:
+        score += 1
+    if has_volume(df['Volume']) and safe_last(df['Volume']) > safe_last(df['Volume_MA']) * 1.5:
+        score += 1
+    if safe_last(df['Close']) > safe_last(df['SMA20']):
+        score += 1
+    return score / 4.0
+
+# ========== MACRO SCORE (NORMALIZED 0-1) ==========
+def get_macro_score_normalized():
+    macro_status, _ = get_macro_signal()
+    if macro_status == "Risk ON":
+        return 1.0
+    elif macro_status == "Neutral":
+        return 0.5
+    else:
+        return 0.0
 
 # ========== GLOBAL MACRO CACHE (ASYNC) ==========
 @st.cache_data(ttl=CACHE_TTL)
@@ -592,6 +611,7 @@ def get_multi_timeframe_trend(ticker):
     }
 
 def calculate_smart_money(df):
+    """Legacy function untuk smart money score 0-4 dan status."""
     if df.empty or len(df) < 20:
         return 0, "Neutral"
     score = 0
@@ -612,7 +632,7 @@ def calculate_smart_money(df):
     return score, status
 
 def get_all_signals(df, volume, ticker):
-    ai_score = calculate_ai_score(df, volume)
+    ai_score = calculate_ai_score(df, volume)  # rule score 0-5
     smart_score, smart_status = calculate_smart_money(df)
     macro_status, macro_score = get_macro_signal()
     best_sector, _ = get_sector_rotation()
@@ -678,7 +698,45 @@ def weighted_decision_engine(df, volume, ticker):
     )
     return round(final_score * 100, 2)
 
-# ========== FUNGSI UNTUK PORTFOLIO OPTIMIZER ==========
+# ========== NEW ENSEMBLE AI SCORE (STEP 3) ==========
+def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple[float, Dict]:
+    """
+    Menghitung final ensemble score (0-100) berdasarkan:
+    - Rule engine (30%)
+    - ML model (30%) - prioritas global model jika ada, else single ticker
+    - Smart money (20%)
+    - Macro (20%)
+    """
+    # 1. Rule score (0-1)
+    rule_score = calculate_rule_score_raw(df, volume)
+    
+    # 2. ML score (0-1)
+    # Coba gunakan global model terlebih dahulu jika tersedia
+    if st.session_state.global_ml_model is not None:
+        ml_prob = get_global_ml_probability(df, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
+    else:
+        ml_prob = ml_prediction_score(df, volume, forward_days=5)
+    
+    # 3. Smart money score (0-1)
+    smart_score = calculate_smart_money_score_normalized(df)
+    
+    # 4. Macro score (0-1)
+    macro_score = get_macro_score_normalized()
+    
+    # Bobot
+    w_rule, w_ml, w_smart, w_macro = 0.30, 0.30, 0.20, 0.20
+    final = (w_rule * rule_score + w_ml * ml_prob + w_smart * smart_score + w_macro * macro_score) * 100
+    final = np.clip(final, 0, 100)
+    
+    breakdown = {
+        "rule": rule_score * 100,
+        "ml": ml_prob * 100,
+        "smart": smart_score * 100,
+        "macro": macro_score * 100
+    }
+    return final, breakdown
+
+# ========== PORTFOLIO OPTIMIZER FUNCTIONS ==========
 def get_portfolio_returns(tickers, period="1y"):
     data = yf.download(tickers, period=period, interval="1d", progress=False, auto_adjust=False)['Close']
     if data.empty:
@@ -837,64 +895,48 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
 
-# ========== TAB 2: AI SIGNAL ==========
+# ========== TAB 2: AI SIGNAL (DENGAN ENSEMBLE BRAIN) ==========
 with tab2:
-    rule_score = calculate_ai_score(data, volume)
-    _, ml_score_single = ml_ai_score(data, volume, forward_days=5)
-    global_ml_score = None
-    if st.session_state.global_ml_model is not None:
-        global_ml_score = get_global_ml_score(data, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
-    ml_score_final = global_ml_score if global_ml_score is not None else ml_score_single
-    final_ensemble = ensemble_score(ml_score_final, rule_score, ml_weight=0.6, rule_weight=0.4)
+    # Hitung ensemble score
+    final_score, breakdown = ensemble_ai_score(data, volume, ticker)
     
-    st.subheader("🧠 ENSEMBLE AI SCORE (ML + Rule)")
-    st.metric("Ensemble Final Score", f"{final_ensemble}%")
-    if final_ensemble >= 70:
+    st.subheader("🧠 ENSEMBLE TRADING BRAIN")
+    st.metric("Final AI Score", f"{final_score:.1f}%")
+    if final_score >= 75:
         st.success("🚀 STRONG BUY SIGNAL")
-    elif final_ensemble >= 55:
-        st.info("🟡 NEUTRAL / SPECULATIVE")
+        signal = "STRONG BUY"
+    elif final_score >= 60:
+        st.info("🟡 BUY / HOLD")
+        signal = "BUY / HOLD"
+    elif final_score >= 45:
+        st.warning("⚠️ NEUTRAL / WAIT")
+        signal = "NEUTRAL"
     else:
-        st.error("🔻 AVOID / BEARISH")
-    st.caption("Ensemble menggabungkan ML probability (60%) dan Rule-based score (40%).")
+        st.error("🔻 SELL / AVOID")
+        signal = "SELL / AVOID"
+    
+    st.caption("Ensemble menggabungkan Rule Engine (30%), ML Model (30%), Smart Money (20%), Macro (20%)")
     st.divider()
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("📊 Rule-Based Score (0-5)")
-        st.metric("Rule Score", f"{rule_score}/5")
-        if rule_score >= 4:
-            st.success("STRONG BUY")
-        elif rule_score == 3:
-            st.info("HOLD")
-        else:
-            st.error("SELL")
-    with col2:
-        st.subheader("🤖 ML Probability (0-100%)")
-        if ml_score_final is not None:
-            st.metric("ML Score", f"{ml_score_final}%")
-            if ml_score_final >= 70:
-                st.success("ML: Bullish")
-            elif ml_score_final >= 55:
-                st.info("ML: Neutral")
-            else:
-                st.error("ML: Bearish")
-            if global_ml_score is not None:
-                st.caption("(Menggunakan global IHSG model)")
-            else:
-                st.caption("(Menggunakan model per ticker)")
-        else:
-            st.info("ML tidak tersedia (data kurang)")
+    # Breakdown
+    st.subheader("🧩 Ensemble Breakdown")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Rule Engine", f"{breakdown['rule']:.1f}%")
+    col2.metric("ML Model", f"{breakdown['ml']:.1f}%")
+    col3.metric("Smart Money", f"{breakdown['smart']:.1f}%")
+    macro_status, _ = get_macro_signal()
+    col4.metric("Macro", macro_status, delta=f"{breakdown['macro']:.1f}%")
     
-    if st.session_state.global_ml_model is not None and st.session_state.global_feature_names:
-        st.subheader("🔥 Feature Importance (Global Model)")
-        importances = st.session_state.global_ml_model.feature_importances_
-        fi_df = pd.DataFrame({
-            "Feature": st.session_state.global_feature_names,
-            "Importance": importances
-        }).sort_values("Importance", ascending=False)
-        st.bar_chart(fi_df.set_index("Feature"))
-        st.caption("Variabel yang paling mempengaruhi keputusan AI.")
+    # Detail
+    with st.expander("Lihat Detail Komponen"):
+        st.write("**Rule Engine:** RSI < 35, Close > SMA20, SMA20 > SMA50, MACD > Signal, Volume > MA")
+        st.write("**ML Model:** RandomForest (probabilitas naik 5 hari ke depan)")
+        st.write("**Smart Money:** CMF, AD trend, volume spike, price vs SMA20")
+        st.write("**Macro:** IHSG trend, USD/IDR, Nasdaq")
     
+    st.divider()
+    
+    # Risk Meter
     st.subheader("🎯 Risk Meter")
     returns = data['Close'].pct_change().dropna()
     if len(returns) > 0:
@@ -918,7 +960,7 @@ with tab2:
         risk = "HIGH"
         st.error(f"Risk Level: {risk} ({annual_vol:.1f}% annual)")
 
-    st.subheader("📊 Probability Engine")
+    st.subheader("📊 Probability Engine (Rule-based)")
     bull = bear = 0
     rsi = safe_last(data['RSI'], 50)
     close = safe_last(data['Close'])
@@ -980,23 +1022,6 @@ with tab2:
         else:
             st.info("Volume tidak tersedia")
 
-    st.header("🧠 AI FINAL PRO")
-    final_score = 0
-    if bull_prob > 60:
-        final_score += 1
-    if risk == "LOW":
-        final_score += 1
-    if momentum > 2:
-        final_score += 1
-    if has_volume(volume) and safe_last(volume) > safe_last(data['Volume_MA']):
-        final_score += 1
-    if final_score >= 2:
-        st.success("🚀 STRONG ACCUMULATE")
-    elif final_score == 1:
-        st.warning("🟡 SPEC BUY")
-    else:
-        st.error("🔻 WAIT / AVOID")
-
     st.header("🚀 GOD MODE TRADING ENGINE")
     price = safe_last(data['Close'])
     support = safe_last(data['support'], price * 0.95)
@@ -1055,11 +1080,11 @@ with tab2:
     else:
         st.error("❌ NO TRADE")
 
-    st.header("FINAL DECISION")
-    if rule_score >= 3:
+    st.header("FINAL DECISION (Ensemble)")
+    if final_score >= 75:
         st.success("🟢 ACCUMULATE")
-    elif rule_score == 2:
-        st.warning("🟡 WAIT")
+    elif final_score >= 60:
+        st.warning("🟡 WAIT / HOLD")
     else:
         st.error("🔴 AVOID")
 
@@ -1109,7 +1134,7 @@ with tab2:
     for sector, val in sector_data.items():
         st.write(f"{sector}: {val:.2%}")
 
-    st.subheader("🎯 Final AI Confidence")
+    st.subheader("🎯 Final AI Confidence (Legacy)")
     confidence = signals['confidence']
     st.metric("Confidence Score", f"{confidence}%")
     if confidence >= 75:
@@ -1150,7 +1175,7 @@ with tab3:
     else:
         st.info("Klik tombol 'Scan Sekarang' untuk memindai saham")
 
-# ========== TAB 4: PORTFOLIO (DENGAN OPTIMIZER) ==========
+# ========== TAB 4: PORTFOLIO ==========
 with tab4:
     st.subheader("📁 Portfolio Tracker")
     with st.expander("➕ Tambah Posisi Baru"):
@@ -1219,12 +1244,11 @@ with tab4:
             st.warning("Stop loss harus di bawah harga saat ini.")
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
-
-    # ========== PORTFOLIO OPTIMIZER MARKOWITZ ==========
+    
+    # Portfolio Optimizer
     st.divider()
     st.subheader("📊 Portfolio Optimizer (Markowitz)")
     st.markdown("Optimasi alokasi portofolio berdasarkan **mean-variance optimization** (Sharpe ratio maksimum).")
-    
     if not SCIPY_AVAILABLE:
         st.warning("Library 'scipy' tidak tersedia. Optimizer tidak bisa berjalan. Silakan install scipy.")
     else:
@@ -1244,33 +1268,28 @@ with tab4:
                                           value=",".join(default_tickers),
                                           help="Contoh: BBCA.JK,BBRI.JK,TLKM.JK")
             tickers_opt = [fix_ticker(t.strip()) for t in tickers_input.split(",") if t.strip()]
-        
         if tickers_opt and len(tickers_opt) >= 2:
             period_opt = st.selectbox("Periode data untuk optimasi", ["1y", "2y", "6mo"], index=0)
             with st.spinner("Menghitung optimasi portofolio..."):
-                returns = get_portfolio_returns(tickers_opt, period=period_opt)
-                if returns.empty or len(returns.columns) < 2:
+                returns_opt = get_portfolio_returns(tickers_opt, period=period_opt)
+                if returns_opt.empty or len(returns_opt.columns) < 2:
                     st.error("Data tidak cukup untuk optimasi. Coba periode lain atau periksa ticker.")
                 else:
-                    opt_weights = optimize_portfolio(returns)
-                    opt_return, opt_vol, opt_sharpe = portfolio_statistics(opt_weights, returns, returns.cov())
-                    
+                    opt_weights = optimize_portfolio(returns_opt)
+                    opt_return, opt_vol, opt_sharpe = portfolio_statistics(opt_weights, returns_opt, returns_opt.cov())
                     col1, col2, col3 = st.columns(3)
                     col1.metric("Expected Annual Return", f"{opt_return*100:.2f}%")
                     col2.metric("Expected Volatility", f"{opt_vol*100:.2f}%")
                     col3.metric("Sharpe Ratio", f"{opt_sharpe:.3f}")
-                    
                     weights_df = pd.DataFrame({
                         "Saham": tickers_opt,
                         "Bobot Optimal": opt_weights,
                         "Bobot (%)": [f"{w*100:.1f}%" for w in opt_weights]
                     }).sort_values("Bobot Optimal", ascending=False)
                     st.dataframe(weights_df, use_container_width=True)
-                    
                     fig_pie = go.Figure(data=[go.Pie(labels=tickers_opt, values=opt_weights, hole=0.4)])
                     fig_pie.update_layout(title="Alokasi Optimal", height=400)
                     st.plotly_chart(fig_pie, use_container_width=True)
-                    
                     st.caption("Optimasi menggunakan metode Mean-Variance (Markowitz) dengan maksimasi Sharpe ratio. Asumsi risk-free rate = 0. Hasil hanya untuk edukasi.")
         else:
             st.info("Pilih minimal 2 saham untuk optimasi.")
@@ -1347,16 +1366,13 @@ with tab6:
         **AD > 0**: Akumulasi (tekanan beli)  
         **CMF > 0**: Tekanan beli  
         **Risk Reward Ratio**: Target/risk > 2 = good setup  
-        **Rule AI Score** 4-5: Strong Buy, 3: Hold, 0-2: Sell  
-        **ML AI Score**: Probabilitas harga naik dalam 5 hari (RandomForest)  
-        **Ensemble Score**: Gabungan ML (60%) + Rule (40%)  
-        **FINAL DECISION** rule score ≥3: Accumulate, =2: Wait, ≤1: Avoid
-        **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly
-        **Smart Money**: Akumulasi jika CMF>0, AD naik, volume spike, price>MA20
-        **Macro**: Risk ON jika IHSG naik, USD turun, Nasdaq naik
-        **Sector Rotation**: Sektor dengan performa 5 hari terbaik
-        **Feature Importance**: Menunjukkan variabel paling berpengaruh dalam model ML global.
-        **Portfolio Optimizer**: Mean-variance optimization untuk alokasi aset optimal.
+        **Ensemble AI Score**: Gabungan Rule (30%), ML (30%), Smart Money (20%), Macro (20%)  
+        **Rule Engine**: 5 kondisi teknikal klasik  
+        **ML Model**: RandomForest yang dilatih dari data IHSG (global atau per ticker)  
+        **Smart Money**: Deteksi akumulasi/distribusi institusi  
+        **Macro Filter**: Risk ON/OFF berdasarkan IHSG, USD/IDR, Nasdaq  
+        **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly  
+        **Portfolio Optimizer**: Mean-variance optimization untuk alokasi aset optimal
         """)
 
 # ========== TAB 7: SMART MONEY ==========
