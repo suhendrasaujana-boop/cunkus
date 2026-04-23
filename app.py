@@ -1,3 +1,4 @@
+# ========== COPY MULAI DARI SINI ==========
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -27,7 +28,7 @@ IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
 ENABLE_ML = True
 ENABLE_NEWS = False if IS_CLOUD else True
 ENABLE_SENTIMENT = False if IS_CLOUD else True
-ENABLE_MULTI_TICKER_ML = not IS_CLOUD
+ENABLE_MULTI_TICKER_ML = False  # Opsi B: matikan global ML di cloud
 
 # ========== IMPORT OPSIONAL ==========
 FEEDPARSER_AVAILABLE = False
@@ -59,7 +60,7 @@ if IS_CLOUD:
     MAX_CHART_POINTS = 150
     CACHE_TTL = 300
     SCANNER_CACHE_TTL = 900
-    st.warning("☁️ **Mode Cloud Aktif** - Optimasi untuk performa terbaik. Multi-ticker ML dinonaktifkan, ensemble tetap jalan.")
+    st.info("☁️ **Mode Cloud** - Performa optimal. Model ML menggunakan data per ticker.")
 else:
     DATA_PERIOD = "2y"
     MAX_CHART_POINTS = 500
@@ -209,7 +210,7 @@ def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 # ========== SCANNER ==========
-@st.cache_data(ttl=SCANNER_CACHE_TTL)
+@st.cache_data(ttl=SCANNER_CACHE_TTL, max_entries=5)
 def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
     try:
         all_data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker", progress=False, threads=True)
@@ -312,25 +313,18 @@ def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
 
 # ========== RULE-BASED AI SCORE (0-5) UNTUK KOMPATIBILITAS ==========
 def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
-    """Legacy function: returns integer 0-5 based on rule conditions."""
     raw = calculate_rule_score_raw(df, volume)
     return int(round(raw * 5))
 
 # ========== MOMENTUM REWARD SIGNAL (0-1) ==========
 def momentum_reward_score(df: pd.DataFrame, lookback: int = 20) -> float:
-    """
-    Menghitung skor reward berdasarkan historical return.
-    Semakin positif reward, semakin besar kecenderungan bullish.
-    Hasil dalam range 0-1.
-    """
     if df.empty or len(df) < lookback:
         return 0.5
     returns = df['Close'].pct_change().dropna()
     if len(returns) < lookback:
         return 0.5
     recent_returns = returns.iloc[-lookback:]
-    reward = (recent_returns > 0).sum() / len(recent_returns)  # proporsi hari naik
-    # Normalisasi ke 0-1: reward 0.5 -> 0.5, reward 1 -> 1, reward 0 -> 0
+    reward = (recent_returns > 0).sum() / len(recent_returns)
     return float(reward)
 
 # ========== MACHINE LEARNING (SINGLE TICKER) ==========
@@ -362,7 +356,6 @@ def train_ml_model(features: pd.DataFrame, labels: pd.Series):
     return model
 
 def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5) -> float:
-    """Return ML probability in range 0-1."""
     if not SKLEARN_AVAILABLE or df.empty or len(df) < 60:
         return 0.5
     features = build_ml_features(df, volume)
@@ -380,8 +373,8 @@ def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int =
     prob = model.predict_proba(latest)[0][1]
     return prob
 
-# ========== MULTI-TICKER GLOBAL ML ==========
-@st.cache_data(ttl=3600)
+# ========== MULTI-TICKER GLOBAL ML (TETAP ADA UNTUK FALLBACK) ==========
+@st.cache_data(ttl=3600, max_entries=2)
 def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
     all_dfs = []
     for t in tickers:
@@ -463,7 +456,6 @@ def calculate_smart_money_score_normalized(df):
     return score / 4.0
 
 def calculate_smart_money(df):
-    """Legacy function: returns (score 0-4, status)"""
     if df.empty or len(df) < 20:
         return 0, "Neutral"
     score = 0
@@ -494,7 +486,7 @@ def get_macro_score_normalized():
         return 0.0
 
 # ========== GLOBAL MACRO CACHE (ASYNC) ==========
-@st.cache_data(ttl=CACHE_TTL)
+@st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_macro_data_async():
     def download_ihsg():
         return yf.download("^JKSE", period="5d", progress=False)['Close']
@@ -524,7 +516,7 @@ def get_macro_signal():
     except:
         return "Neutral", 1
 
-@st.cache_data(ttl=CACHE_TTL)
+@st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_sector_rotation():
     sectors = {
         "Bank": ["BBRI.JK","BMRI.JK","BBCA.JK"],
@@ -554,7 +546,7 @@ def get_sector_rotation():
     best = max(sector_perf, key=sector_perf.get)
     return best, sector_perf
 
-@st.cache_data(ttl=CACHE_TTL)
+@st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float]]:
     if not tickers:
         return {}
@@ -630,7 +622,7 @@ def get_news_sentiment():
     except Exception:
         return None
 
-@st.cache_data(ttl=CACHE_TTL)
+@st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_multi_timeframe_trend(ticker):
     time.sleep(random.uniform(0.1, 0.3))
     daily = load_data(ticker, "1d")
@@ -653,7 +645,7 @@ def get_multi_timeframe_trend(ticker):
     }
 
 def get_all_signals(df, volume, ticker):
-    ai_score = calculate_ai_score(df, volume)  # rule score 0-5
+    ai_score = calculate_ai_score(df, volume)
     smart_score, smart_status = calculate_smart_money(df)
     macro_status, macro_score = get_macro_signal()
     best_sector, _ = get_sector_rotation()
@@ -721,38 +713,18 @@ def weighted_decision_engine(df, volume, ticker):
 
 # ========== NEW ENSEMBLE AI SCORE (DENGAN MOMENTUM REWARD) ==========
 def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple[float, Dict]:
-    """
-    Menghitung final ensemble score (0-100) berdasarkan:
-    - Rule engine (25%)
-    - ML model (25%)
-    - Smart money (20%)
-    - Macro (20%)
-    - Momentum Reward (10%)
-    """
-    # 1. Rule score (0-1)
     rule_score = calculate_rule_score_raw(df, volume)
-    
-    # 2. ML score (0-1)
     if st.session_state.global_ml_model is not None:
         ml_prob = get_global_ml_probability(df, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
     else:
         ml_prob = ml_prediction_score(df, volume, forward_days=5)
-    
-    # 3. Smart money score (0-1)
     smart_score = calculate_smart_money_score_normalized(df)
-    
-    # 4. Macro score (0-1)
     macro_score = get_macro_score_normalized()
-    
-    # 5. Momentum reward score (0-1) - berdasarkan proporsi hari naik dalam 20 hari terakhir
     reward_score = momentum_reward_score(df, lookback=20)
-    
-    # Bobot baru: 25%, 25%, 20%, 20%, 10%
     w_rule, w_ml, w_smart, w_macro, w_reward = 0.25, 0.25, 0.20, 0.20, 0.10
     final = (w_rule * rule_score + w_ml * ml_prob + w_smart * smart_score + 
              w_macro * macro_score + w_reward * reward_score) * 100
     final = np.clip(final, 0, 100)
-    
     breakdown = {
         "rule": rule_score * 100,
         "ml": ml_prob * 100,
@@ -813,7 +785,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Data dari Yahoo Finance | Update 5 menit")
 
-# ========== TRAINING GLOBAL MODEL ==========
+# ========== TRAINING GLOBAL MODEL (NONAKTIF) ==========
 if ENABLE_MULTI_TICKER_ML and SKLEARN_AVAILABLE and st.session_state.global_ml_model is None:
     with st.spinner("Melatih global AI model dari seluruh IHSG (sekali saja)..."):
         model, features = train_global_model(IHSG_BLUE_CHIPS)
@@ -921,11 +893,9 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
 
-# ========== TAB 2: AI SIGNAL (DENGAN ENSEMBLE + REWARD) ==========
+# ========== TAB 2: AI SIGNAL ==========
 with tab2:
-    # Hitung ensemble score (termasuk reward)
     final_score, breakdown = ensemble_ai_score(data, volume, ticker)
-    
     st.subheader("🧠 ENSEMBLE TRADING BRAIN")
     st.metric("Final AI Score", f"{final_score:.1f}%")
     if final_score >= 75:
@@ -940,11 +910,8 @@ with tab2:
     else:
         st.error("🔻 SELL / AVOID")
         signal = "SELL / AVOID"
-    
     st.caption("Ensemble: Rule (25%) + ML (25%) + Smart Money (20%) + Macro (20%) + Momentum Reward (10%)")
     st.divider()
-    
-    # Breakdown (5 komponen)
     st.subheader("🧩 Ensemble Breakdown")
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Rule Engine", f"{breakdown['rule']:.1f}%")
@@ -953,17 +920,13 @@ with tab2:
     macro_status, _ = get_macro_signal()
     col4.metric("Macro", macro_status, delta=f"{breakdown['macro']:.1f}%")
     col5.metric("Momentum Reward", f"{breakdown['reward']:.1f}%")
-    
     with st.expander("Lihat Detail Komponen"):
         st.write("**Rule Engine:** RSI < 35, Close > SMA20, SMA20 > SMA50, MACD > Signal, Volume > MA")
         st.write("**ML Model:** RandomForest (probabilitas naik 5 hari ke depan)")
         st.write("**Smart Money:** CMF, AD trend, volume spike, price vs SMA20")
         st.write("**Macro:** IHSG trend, USD/IDR, Nasdaq")
         st.write("**Momentum Reward:** Proporsi hari naik dalam 20 hari terakhir (reward-based)")
-    
     st.divider()
-    
-    # Risk Meter (sama seperti sebelumnya)
     st.subheader("🎯 Risk Meter")
     returns = data['Close'].pct_change().dropna()
     if len(returns) > 0:
@@ -1272,7 +1235,6 @@ with tab4:
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
     
-    # Portfolio Optimizer (Markowitz)
     st.divider()
     st.subheader("📊 Portfolio Optimizer (Markowitz)")
     st.markdown("Optimasi alokasi portofolio berdasarkan **mean-variance optimization** (Sharpe ratio maksimum).")
@@ -1470,3 +1432,4 @@ st.markdown("---")
 st.caption("⚠️ **DISCLAIMER:** Dashboard ini hanya untuk edukasi dan analisis otomatis. Bukan rekomendasi beli/jual. Keputusan investasi sepenuhnya risiko Anda.")
 
 gc.collect()
+# ========== COPY SAMPAI SINI ==========
