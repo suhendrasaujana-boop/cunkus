@@ -790,7 +790,7 @@ with st.sidebar:
 import os
 
 if ENABLE_MULTI_TICKER_ML and SKLEARN_AVAILABLE and st.session_state.global_ml_model is None:
-    model_path = "global_model.joblib"
+    model_path = os.path.join(os.path.dirname(__file__), "global_model.joblib")
     if os.path.exists(model_path):
         with st.spinner("Memuat pre-trained global AI model..."):
             try:
