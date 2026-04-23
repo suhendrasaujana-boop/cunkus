@@ -787,10 +787,15 @@ with st.sidebar:
     st.caption("Data dari Yahoo Finance | Update 5 menit")
 
 # ========== LOAD PRE-TRAINED GLOBAL MODEL ==========
+import joblib
 import os
 
 if ENABLE_MULTI_TICKER_ML and SKLEARN_AVAILABLE and st.session_state.global_ml_model is None:
-    model_path = os.path.join(os.path.dirname(__file__), "global_model.joblib")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(current_dir, "global_model.joblib")
+    
+    st.write(f"🔍 Mencari model di: {model_path}")
+    
     if os.path.exists(model_path):
         with st.spinner("Memuat pre-trained global AI model..."):
             try:
@@ -799,9 +804,9 @@ if ENABLE_MULTI_TICKER_ML and SKLEARN_AVAILABLE and st.session_state.global_ml_m
                 st.session_state.global_feature_names = saved['feature_names']
                 st.success("✅ Global ML model siap! (Pre-trained dari 15 saham)")
             except Exception as e:
-                st.warning(f"⚠️ Gagal memuat model: {e}. Fallback ke model per ticker.")
+                st.error(f"❌ Gagal memuat model: {e}")
     else:
-        st.info("📦 Model global tidak ditemukan. Menggunakan model per ticker.")
+        st.warning(f"⚠️ File model tidak ditemukan di: {model_path}")
 
 # ========== LOAD DATA ==========
 with st.spinner("Memuat data..."):
