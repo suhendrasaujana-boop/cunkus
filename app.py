@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from plotly.subplots import make_subplots
 import os
 import gc
+import joblib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== TAMBAHAN UNTUK PORTFOLIO OPTIMIZER ==========
@@ -786,7 +787,6 @@ with st.sidebar:
     st.caption("Data dari Yahoo Finance | Update 5 menit")
 
 # ========== LOAD PRE-TRAINED GLOBAL MODEL ==========
-import joblib
 import os
 
 if ENABLE_MULTI_TICKER_ML and SKLEARN_AVAILABLE and st.session_state.global_ml_model is None:
