@@ -114,7 +114,6 @@ if 'scan_result' not in st.session_state:
 
 # ========== FUNGSI BANTU ==========
 def safe_last(series: pd.Series, default=0.0):
-    # FIX #21: Handle None series
     if series is None or len(series) == 0:
         return default
     return series.iloc[-1]
@@ -174,7 +173,6 @@ def show_notification(message: str, type: str = "toast", icon: str = "ℹ️"):
         else:
             st.info(message)
 
-# FIX #19: Cache fundamental details
 @st.cache_data(ttl=3600, max_entries=20)
 def get_fundamental_details(ticker: str) -> Dict[str, Any]:
     try:
@@ -197,7 +195,7 @@ def get_fundamental_details(ticker: str) -> Dict[str, Any]:
         return {}
 
 # ========== LOAD DATA DENGAN CACHE ==========
-@st.cache_data(ttl=CACHE_TTL, max_entries=8) # FIX #14: Turunkan max_entries
+@st.cache_data(ttl=CACHE_TTL, max_entries=8)
 def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
     try:
         df = yf.download(ticker, period=DATA_PERIOD, interval=timeframe, progress=False, auto_adjust=False)
@@ -225,7 +223,6 @@ def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
         rows = []
         for ticker in tickers:
             try:
-                # FIX #3: Handle single ticker flat columns
                 if isinstance(all_data.columns, pd.MultiIndex):
                     if ticker not in all_data.columns.get_level_values(0):
                         continue
@@ -301,7 +298,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['BB_middle'] = np.nan
         df['BB_lower'] = np.nan
     
-    # FIX #8: Hanya fillna untuk kolom tertentu yang aman
     cols_to_fill = ['RSI', 'MACD', 'MACD_signal', 'SMA20', 'SMA50', 'Volume_MA', 'support', 'resistance', 'AD', 'CMF']
     for c in cols_to_fill:
         if c in df.columns:
@@ -381,7 +377,6 @@ def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int =
     if len(features) < 50:
         return 0.5
     
-    # FIX #4: Tangani NaN pada label dengan benar
     valid = labels.notna()
     features, labels = features[valid], labels[valid].astype(int)
     
@@ -473,7 +468,6 @@ def calculate_smart_money_score_normalized(df):
         score += 1
     if len(df) >= 5 and safe_last(df['AD']) > df['AD'].iloc[-5]:
         score += 1
-    # FIX #7: Jika tidak ada volume, jangan kurangi max_score agar tidak bias
     if has_volume(df['Volume']):
         if safe_last(df['Volume']) > safe_last(df['Volume_MA']) * 1.5:
             score += 1
@@ -542,10 +536,9 @@ def get_macro_signal():
             return "Neutral", score
         else:
             return "Risk OFF", score
-    except Exception as e: # FIX #6: Bare except diganti
+    except Exception as e:
         return "Neutral", 1
 
-# FIX #11: Batch download sector rotation
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_sector_rotation():
     sectors = {
@@ -566,7 +559,7 @@ def get_sector_rotation():
         returns = []
         for t in tickers:
             try:
-                if isinstance(data, pd.Series): # If only 1 ticker (fallback)
+                if isinstance(data, pd.Series): 
                     close = data
                 elif t in data.columns:
                     close = data[t]
@@ -665,7 +658,6 @@ def get_news_sentiment():
 
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_multi_timeframe_trend(ticker):
-    # FIX #18: Sleep dihapus karena tidak berguna di dalam cache
     daily = load_data(ticker, "1d")
     weekly = load_data(ticker, "1wk")
     monthly = load_data(ticker, "1mo")
@@ -700,7 +692,6 @@ def get_all_signals(df, volume, ticker):
     elif macro_status == "Risk OFF":
         confidence -= 10
     
-    # FIX #1: perbaiki sector map check
     sector_map = {
         "Bank": ["BBRI", "BMRI", "BBCA"],
         "Mining": ["ADRO", "ITMG", "ANTM"],
@@ -730,7 +721,6 @@ def weighted_decision_engine(df, volume, ticker):
     macro_map = {"Risk ON": 1, "Neutral": 0.5, "Risk OFF": 0}
     macro_score = macro_map.get(signals['macro_status'], 0.5)
     
-    # FIX #1: perbaiki logika pengecekan sektor
     sector_map = {
         "Bank": ["BBRI","BMRI","BBCA"],
         "Mining": ["ADRO","ITMG","ANTM"],
@@ -759,4 +749,21 @@ def weighted_decision_engine(df, volume, ticker):
     final_score = (
         0.30 * tech_score +
         0.20 * smart_score +
-        0.15 * macro
+        0.15 * macro_score +
+        0.10 * sector_score +
+        0.10 * risk_score +
+        0.15 * momentum_score
+    )
+    return round(final_score * 100, 2)
+
+# ========== NEW ENSEMBLE AI SCORE ==========
+def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple[float, Dict]:
+    rule_score = calculate_rule_score_raw(df, volume)
+    if st.session_state.global_ml_model is not None:
+        ml_prob = get_global_ml_probability(df, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
+    else:
+        ml_prob = ml_prediction_score(df, volume, forward_days=5)
+    smart_score = calculate_smart_money_score_normalized(df)
+    macro_score = get_macro_score_normalized()
+    reward_score = momentum_reward_score(df, lookback=20)
+    w_rule, w_ml, w
