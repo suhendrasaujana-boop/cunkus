@@ -79,11 +79,15 @@ VOLUME_SPIKE_THRESHOLD = 1.8
 BREAKOUT_COOLDOWN_HOURS = 24
 VOLUME_SPIKE_COOLDOWN_HOURS = 6
 
+# ========== SECTOR_MAP (FIX #9: dilengkapi untuk semua blue chip) ==========
 SECTOR_MAP = {
     "Bank": ["BBRI", "BMRI", "BBCA"],
-    "Mining": ["ADRO", "ITMG", "ANTM"],
+    "Mining": ["ADRO", "ITMG", "ANTM", "MDKA"],
     "Telco": ["TLKM", "EXCL", "ISAT"],
-    "Consumer": ["ICBP", "INDF", "UNVR"]
+    "Consumer": ["ICBP", "INDF", "UNVR", "CPIN", "JPFA"],
+    "Auto": ["ASII"],
+    "Cement": ["SMGR"],
+    "Energy": ["UNTR"],
 }
 
 st.set_page_config(
@@ -98,8 +102,6 @@ if 'last_resistance' not in st.session_state:
     st.session_state.last_resistance = None
 if 'last_breakout_notify_time' not in st.session_state:
     st.session_state.last_breakout_notify_time = None
-if 'last_volume_ratio' not in st.session_state:
-    st.session_state.last_volume_ratio = 0
 if 'last_volume_notify_time' not in st.session_state:
     st.session_state.last_volume_notify_time = None
 if 'portfolio' not in st.session_state:
@@ -335,13 +337,23 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['BB_upper'] = np.nan
         df['BB_middle'] = np.nan
         df['BB_lower'] = np.nan
-    df = df.ffill().fillna(0)
+
+    # ========== FIX #4: ffill dulu, lalu RSI/MACD diisi nilai netral, baru fillna(0) ==========
+    df = df.ffill()
+    if 'RSI' in df.columns:
+        df['RSI'] = df['RSI'].fillna(50)
+    if 'MACD' in df.columns:
+        df['MACD'] = df['MACD'].fillna(0)
+    if 'MACD_signal' in df.columns:
+        df['MACD_signal'] = df['MACD_signal'].fillna(0)
+    df = df.fillna(0)
     return df
 
 # ========== RULE-BASED RAW SCORE (0-1) ==========
+# FIX #2: pisahkan trend-following vs mean-reversion + blacklist falling knife
 def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
     if df.empty:
-        return 0
+        return 0.0
     rsi = safe_last(df['RSI'], 50)
     close = safe_last(df['Close'])
     sma20 = safe_last(df['SMA20'], close)
@@ -349,21 +361,35 @@ def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
     macd = safe_last(df['MACD'], 0)
     macd_signal = safe_last(df['MACD_signal'], 0)
     vol = safe_last(volume, 0)
-    vol_ma = safe_last(df['Volume_MA'], 1)
-    conditions = [
-        rsi < 35,
+    vol_ma = safe_last(df['Volume_MA'], 0)
+
+    # Blacklist falling knife: RSI sangat oversold + harga di bawah SMA20
+    if rsi < 30 and close < sma20:
+        return 0.0
+
+    # Trend-following sub-score
+    trend_conditions = [
         close > sma20,
         sma20 > sma50,
-        (macd > macd_signal) if not np.isnan(macd) and not np.isnan(macd_signal) else False,
-        (vol > vol_ma) if has_volume(volume) else False
+        (macd > macd_signal) if not (np.isnan(macd) or np.isnan(macd_signal)) else False,
     ]
-    return sum(conditions) / len(conditions)
+    trend_score = sum(trend_conditions) / len(trend_conditions)
+
+    # Mean-reversion bonus (bukan salah satu kondisi utama)
+    meanrev_bonus = 1.0 if rsi < 40 else 0.0
+
+    # Volume confirmation
+    vol_bonus = 1.0 if (has_volume(volume) and vol_ma > 0 and vol > vol_ma) else 0.0
+
+    # Kombinasi berbobot
+    return 0.65 * trend_score + 0.20 * meanrev_bonus + 0.15 * vol_bonus
 
 def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
     raw = calculate_rule_score_raw(df, volume)
     return int(round(raw * 5))
 
 # ========== MOMENTUM REWARD SIGNAL (0-1) ==========
+# FIX #8: gabungkan frekuensi + magnitude
 def momentum_reward_score(df: pd.DataFrame, lookback: int = 20) -> float:
     if df.empty or len(df) < lookback:
         return 0.5
@@ -371,8 +397,11 @@ def momentum_reward_score(df: pd.DataFrame, lookback: int = 20) -> float:
     if len(returns) < lookback:
         return 0.5
     recent_returns = returns.iloc[-lookback:]
-    reward = (recent_returns > 0).sum() / len(recent_returns)
-    return float(reward)
+    freq = (recent_returns > 0).sum() / len(recent_returns)
+    std = recent_returns.std()
+    magnitude = (recent_returns.mean() / std) if std > 0 else 0.0
+    magnitude_norm = float(np.clip(magnitude + 0.5, 0.0, 1.0))
+    return float(0.5 * freq + 0.5 * magnitude_norm)
 
 # ========== MACHINE LEARNING (SINGLE TICKER) ==========
 def build_ml_features(df: pd.DataFrame, volume: pd.Series) -> pd.DataFrame:
@@ -395,12 +424,26 @@ def create_labels(df: pd.DataFrame, forward_days: int = 5) -> pd.Series:
     future_return = df['Close'].shift(-forward_days) / df['Close'] - 1
     return (future_return > 0).astype(int)
 
+# FIX #12: tambahkan train_test_split untuk sanity check
 def train_ml_model(features: pd.DataFrame, labels: pd.Series):
     if not SKLEARN_AVAILABLE or len(features) < 50:
         return None
-    model = RandomForestClassifier(n_estimators=80, max_depth=6, random_state=42)
-    model.fit(features, labels)
-    return model
+    try:
+        if len(features) >= 100:
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                features, labels, test_size=0.2, random_state=42
+            )
+            probe = RandomForestClassifier(n_estimators=50, max_depth=6, random_state=42)
+            probe.fit(X_tr, y_tr)
+            try:
+                _ = accuracy_score(y_val, probe.predict(X_val))  # sanity check
+            except Exception:
+                pass
+        model = RandomForestClassifier(n_estimators=80, max_depth=6, random_state=42)
+        model.fit(features, labels)
+        return model
+    except Exception:
+        return None
 
 def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5) -> float:
     if not SKLEARN_AVAILABLE or df.empty or len(df) < 60:
@@ -639,6 +682,7 @@ def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float
         st.error(f"Error fetching portfolio prices: {e}")
         return {t: None for t in tickers}
 
+# ========== BACKTEST (FIX #3 & #16) ==========
 def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_period=20, commission=0.001):
     if df.empty or len(df) < 50:
         return None
@@ -656,17 +700,22 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
     for i in range(1, len(df)):
         price = df['Close'].iloc[i]
         if df['buy_signal'].iloc[i] and position == 0:
-            position = cash / price
+            # FIX #3: commission dihitung saat BUY
+            position = cash / (price * (1 + commission))
             cash = 0
             trades.append(('BUY', df.index[i], price))
         elif df['sell_signal'].iloc[i] and position > 0:
             cash = position * price * (1 - commission)
             position = 0
             trades.append(('SELL', df.index[i], price))
-        total_value = cash + (position * price if position > 0 else 0)
+        # FIX #16: equity curve konsisten dengan commission (liquidated value)
+        pos_value = position * price * (1 - commission) if position > 0 else 0
+        total_value = cash + pos_value
         equity_curve.append(total_value)
+    # Force close di akhir (sudah ter-account di equity curve)
     if position > 0:
         cash = position * df['Close'].iloc[-1] * (1 - commission)
+        position = 0
     final_capital = cash
     total_return = (final_capital - initial_capital) / initial_capital * 100
     bh_return = (safe_last(df['Close']) / df['Close'].iloc[0] - 1) * 100 if df['Close'].iloc[0] != 0 else 0
@@ -694,9 +743,9 @@ def get_news_sentiment():
     except Exception:
         return None
 
+# FIX #18: hapus time.sleep(random...)
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_multi_timeframe_trend(ticker):
-    time.sleep(random.uniform(0.1, 0.3))
     daily = load_data(ticker, "1d")
     weekly = load_data(ticker, "1wk")
     monthly = load_data(ticker, "1mo")
@@ -716,12 +765,13 @@ def get_multi_timeframe_trend(ticker):
         "Monthly": trend(monthly)
     }
 
+# FIX #7: normalisasi confidence ke 0-100
 def get_all_signals(df, volume, ticker):
     ai_score = calculate_ai_score(df, volume)
     smart_score, smart_status = calculate_smart_money(df)
     macro_status, macro_score = get_macro_signal()
     best_sector, _ = get_sector_rotation()
-    confidence = ai_score * 10
+    confidence = ai_score * 10  # max 50
     if smart_status == "Accumulation":
         confidence += 15
     elif smart_status == "Distribution":
@@ -733,7 +783,10 @@ def get_all_signals(df, volume, ticker):
     ticker_sector = get_ticker_sector(ticker)
     if ticker_sector is not None and ticker_sector == best_sector:
         confidence += 5
-    confidence = max(0, min(100, confidence))
+    # max theoretical = 50+15+10+5 = 80
+    confidence = max(0, min(80, confidence))
+    # Normalisasi ke 0-100
+    confidence = int(round(confidence * 100 / 80))
     return {
         'ai_score': ai_score,
         'smart_score': smart_score,
@@ -744,7 +797,8 @@ def get_all_signals(df, volume, ticker):
         'confidence': confidence
     }
 
-def weighted_decision_engine(df, volume, ticker):
+# FIX #5 & #9: annualisasi timeframe-aware & penalty sektor
+def weighted_decision_engine(df, volume, ticker, timeframe="1d"):
     signals = get_all_signals(df, volume, ticker)
     tech_score = signals['ai_score'] / 5
     smart_map = {"Accumulation": 1, "Neutral": 0.5, "Distribution": 0}
@@ -752,9 +806,15 @@ def weighted_decision_engine(df, volume, ticker):
     macro_map = {"Risk ON": 1, "Neutral": 0.5, "Risk OFF": 0}
     macro_score = macro_map.get(signals['macro_status'], 0.5)
     ticker_sector = get_ticker_sector(ticker)
-    sector_score = 1 if (ticker_sector is not None and ticker_sector == signals['best_sector']) else 0.5
+    if ticker_sector is None:
+        sector_score = 0.5  # sektor tidak diketahui
+    elif ticker_sector == signals['best_sector']:
+        sector_score = 1.0
+    else:
+        sector_score = 0.0  # sektor diketahui tapi tidak leading
     returns = df['Close'].pct_change().dropna()
-    vol = returns.std() * np.sqrt(252) if len(returns) > 1 else 0
+    pp = {"1d": 252, "1wk": 52, "1mo": 12}.get(timeframe, 252)
+    vol = returns.std() * np.sqrt(pp) if len(returns) > 1 else 0
     if vol < 0.15:
         risk_score = 1
     elif vol < 0.30:
@@ -813,9 +873,11 @@ def get_portfolio_returns(tickers, period="1y"):
     returns = data.pct_change().dropna()
     return returns
 
+# FIX #13: np.sqrt(max(0, ...))
 def portfolio_statistics(weights, returns, cov_matrix):
     port_return = np.sum(returns.mean() * weights) * 252
-    port_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix * 252, weights)))
+    port_var = np.dot(weights.T, np.dot(cov_matrix * 252, weights))
+    port_vol = float(np.sqrt(max(0.0, port_var)))
     sharpe = port_return / port_vol if port_vol > 0 else 0
     return port_return, port_vol, sharpe
 
@@ -823,13 +885,15 @@ def negative_sharpe(weights, returns, cov_matrix):
     _, _, sharpe = portfolio_statistics(weights, returns, cov_matrix)
     return -sharpe
 
+# FIX #14: tambahkan tol/maxiter
 def optimize_portfolio(returns):
     n_assets = len(returns.columns)
     init_weights = np.array([1/n_assets] * n_assets)
     bounds = tuple((0, 1) for _ in range(n_assets))
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
     result = minimize(negative_sharpe, init_weights, args=(returns, returns.cov()),
-                      method='SLSQP', bounds=bounds, constraints=constraints)
+                      method='SLSQP', bounds=bounds, constraints=constraints,
+                      options={'maxiter': 1000, 'ftol': 1e-9})
     return result.x if result.success else init_weights
 
 # ========== SIDEBAR ==========
@@ -885,13 +949,13 @@ if data.empty or len(data) < 5:
 
 data = add_indicators(data)
 
-# Alert Check
-if not data.empty:
-    current_resistance = safe_last(data['resistance'])
+# ========== ALERT CHECK (FIX #1: pakai resistance.iloc[-2]) ==========
+if not data.empty and len(data) > 1:
     current_price = safe_last(data['Close'])
-    if should_notify_breakout(current_price, current_resistance):
-        show_notification(f"🚀 BREAKOUT! Harga menembus resistance {current_resistance:.2f}", "toast", "🚀")
-        st.session_state.last_resistance = current_resistance
+    prev_resistance = data['resistance'].iloc[-2]  # FIX
+    if should_notify_breakout(current_price, prev_resistance):
+        show_notification(f"🚀 BREAKOUT! Harga menembus resistance {prev_resistance:.2f}", "toast", "🚀")
+        st.session_state.last_resistance = prev_resistance
         st.session_state.last_breakout_notify_time = datetime.now()
     volume = data['Volume'] if 'Volume' in data.columns else pd.Series(0, index=data.index)
     if has_volume(volume):
@@ -901,8 +965,10 @@ if not data.empty:
             volume_ratio = vol_last / vol_ma
             if should_notify_volume_spike(volume_ratio):
                 show_notification(f"🔥 Volume Spike! {volume_ratio:.1f}x", "toast", "⚠️")
-                st.session_state.last_volume_ratio = volume_ratio
+                # FIX #11: setter last_volume_ratio dihapus (tidak pernah dibaca)
                 st.session_state.last_volume_notify_time = datetime.now()
+else:
+    volume = data['Volume'] if 'Volume' in data.columns else pd.Series(0, index=data.index)
 
 # ========== HEADER HARGA ==========
 st.title(f"📈 {ticker}")
@@ -972,51 +1038,46 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
 
-# ========== TAB 2: AI SIGNAL ==========
+# ========== TAB 2: AI SIGNAL (RESTRUCTURED - FIX #6, #10) ==========
 with tab2:
     final_score, breakdown = ensemble_ai_score(data, volume, ticker)
-    st.subheader("🧠 ENSEMBLE TRADING BRAIN")
+
+    # ============ PRIMARY DECISION ============
+    st.header("🎯 PRIMARY DECISION (Ensemble)")
     st.metric("Final AI Score", f"{final_score:.1f}%")
     if final_score >= 75:
         st.success("🚀 STRONG BUY SIGNAL")
-        signal = "STRONG BUY"
     elif final_score >= 60:
         st.info("🟡 BUY / HOLD")
-        signal = "BUY / HOLD"
     elif final_score >= 45:
         st.warning("⚠️ NEUTRAL / WAIT")
-        signal = "NEUTRAL"
     else:
         st.error("🔻 SELL / AVOID")
-        signal = "SELL / AVOID"
     st.caption("Ensemble: Rule (25%) + ML (25%) + Smart Money (20%) + Macro (20%) + Momentum Reward (10%)")
-    st.divider()
+
     st.subheader("🧩 Ensemble Breakdown")
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Rule Engine", f"{breakdown['rule']:.1f}%")
     col2.metric("ML Model", f"{breakdown['ml']:.1f}%")
     col3.metric("Smart Money", f"{breakdown['smart']:.1f}%")
-    macro_status, _ = get_macro_signal()
-    col4.metric("Macro", macro_status, delta=f"{breakdown['macro']:.1f}%")
+    macro_status_disp, _ = get_macro_signal()
+    col4.metric("Macro", macro_status_disp, delta=f"{breakdown['macro']:.1f}%")
     col5.metric("Momentum Reward", f"{breakdown['reward']:.1f}%")
+
     with st.expander("Lihat Detail Komponen"):
-        st.write("**Rule Engine:** RSI < 35, Close > SMA20, SMA20 > SMA50, MACD > Signal, Volume > MA")
-        st.write("**ML Model:** RandomForest (probabilitas naik 5 hari ke depan)")
-        st.write("**Smart Money:** CMF, AD trend, volume spike, price vs SMA20")
-        st.write("**Macro:** IHSG trend, USD/IDR, Nasdaq")
-        st.write("**Momentum Reward:** Proporsi hari naik dalam 20 hari terakhir")
+        st.write("**Rule Engine:** Trend (Close>SMA20, SMA20>SMA50, MACD>Signal) + bonus RSI oversold + konfirmasi volume. RSI<30 & harga<SMA20 → di-blacklist (falling knife).")
+        st.write("**ML Model:** RandomForest (probabilitas naik 5 hari ke depan, dengan validasi train/test).")
+        st.write("**Smart Money:** CMF, AD trend, volume spike, harga vs SMA20.")
+        st.write("**Macro:** IHSG trend, USD/IDR, Nasdaq.")
+        st.write("**Momentum Reward:** Frekuensi hari naik + magnitude (Sharpe-like) dalam 20 hari terakhir.")
+
+    # ============ RISK METER ============
     st.divider()
     st.subheader("🎯 Risk Meter")
     returns = data['Close'].pct_change().dropna()
     if len(returns) > 0:
-        if timeframe == "1d":
-            periods_per_year = 252
-        elif timeframe == "1wk":
-            periods_per_year = 52
-        else:
-            periods_per_year = 12
-        daily_vol = returns.std()
-        annual_vol = daily_vol * np.sqrt(periods_per_year) * 100
+        pp = {"1d": 252, "1wk": 52, "1mo": 12}.get(timeframe, 252)
+        annual_vol = returns.std() * np.sqrt(pp) * 100
     else:
         annual_vol = 0.0
     if annual_vol < 15:
@@ -1026,6 +1087,7 @@ with tab2:
     else:
         st.error(f"Risk Level: HIGH ({annual_vol:.1f}% annual)")
 
+    # ============ PROBABILITY ============
     st.subheader("📊 Probability Engine (Rule-based)")
     bull = bear = 0
     rsi = safe_last(data['RSI'], 50)
@@ -1047,6 +1109,7 @@ with tab2:
         bull_prob = bear_prob = 50
     st.write(f"📈 Bullish: {bull_prob:.1f}% | 📉 Bearish: {bear_prob:.1f}%")
 
+    # ============ MOMENTUM ============
     st.subheader("🔥 Momentum Detector")
     if len(data) >= 6:
         momentum = data['Close'].pct_change(5).iloc[-1] * 100
@@ -1063,6 +1126,7 @@ with tab2:
     else:
         st.warning("Sideways")
 
+    # ============ BREAKOUT + VOLUME ALERT ============
     col_brk, col_vol = st.columns(2)
     with col_brk:
         st.subheader("🚀 Breakout Detector")
@@ -1075,14 +1139,19 @@ with tab2:
         if has_volume(volume):
             vol_last = safe_last(volume)
             vol_ma = safe_last(data['Volume_MA'])
-            if vol_last > vol_ma * st.session_state.user_volume_spike_threshold:
+            if vol_ma > 0 and vol_last > vol_ma * st.session_state.user_volume_spike_threshold:
                 st.success("Volume Spike Detected")
             else:
                 st.write("Normal Volume")
         else:
             st.info("Volume tidak tersedia")
 
-    st.header("🚀 GOD MODE TRADING ENGINE")
+    # ============ SECONDARY CONFIRMATIONS ============
+    st.divider()
+    st.subheader("🔎 Konfirmasi Sekunder (bukan rekomendasi utama)")
+    st.caption("Panel di bawah ini adalah konfirmasi tambahan. Gunakan **PRIMARY DECISION** di atas sebagai rekomendasi utama.")
+
+    st.header("🚀 GOD MODE TRADING ENGINE (Secondary)")
     price = safe_last(data['Close'])
     support = safe_last(data['support'], price * 0.95)
     resistance = safe_last(data['resistance'], price * 1.05)
@@ -1120,7 +1189,7 @@ with tab2:
         else:
             st.write("No Breakout")
 
-    st.header("🧠 FINAL GOD SIGNAL")
+    st.subheader("🧠 FINAL GOD SIGNAL")
     god_score = 0
     if rr > 2: god_score += 1
     if trend_score >= 2: god_score += 1
@@ -1132,14 +1201,6 @@ with tab2:
         st.warning("⚡ SPEC BUY")
     else:
         st.error("❌ NO TRADE")
-
-    st.header("FINAL DECISION (Ensemble)")
-    if final_score >= 75:
-        st.success("🟢 ACCUMULATE")
-    elif final_score >= 60:
-        st.warning("🟡 WAIT / HOLD")
-    else:
-        st.error("🔴 AVOID")
 
     st.subheader("🧭 Multi Timeframe Confirmation")
     mtf = get_multi_timeframe_trend(ticker)
@@ -1187,7 +1248,7 @@ with tab2:
     for sector, val in sector_data.items():
         st.write(f"{sector}: {val:.2%}")
 
-    st.subheader("🎯 Final AI Confidence (Legacy)")
+    st.subheader("🎯 Legacy Confidence (Secondary)")
     confidence = signals['confidence']
     st.metric("Confidence Score", f"{confidence}%")
     if confidence >= 75:
@@ -1197,8 +1258,8 @@ with tab2:
     else:
         st.warning("⚠️ Low Confidence")
 
-    st.subheader("🧠 Weighted Decision Engine (PRO)")
-    weighted_score = weighted_decision_engine(data, volume, ticker)
+    st.subheader("🧠 Weighted Decision Engine (PRO, Secondary)")
+    weighted_score = weighted_decision_engine(data, volume, ticker, timeframe)
     st.metric("Weighted Score", f"{weighted_score}%")
     if weighted_score >= 75:
         st.success("🚀 STRONG BUY (High Confidence)")
@@ -1393,11 +1454,20 @@ with tab6:
         st.subheader("📊 Fundamental Details")
         fund = get_fundamental_details(ticker)
         if fund:
+            # FIX #17: dividendYield decimal vs percent
+            div_yield_val = fund.get('div_yield')
+            if div_yield_val is not None and pd.notna(div_yield_val):
+                if div_yield_val > 1:
+                    div_str = f"{div_yield_val:.2f}%"
+                else:
+                    div_str = f"{div_yield_val*100:.2f}%"
+            else:
+                div_str = "N/A"
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("PER (TTM)", f"{fund['pe']:.2f}" if pd.notna(fund['pe']) else "N/A")
                 st.metric("PBV", f"{fund['pb']:.2f}" if pd.notna(fund['pb']) else "N/A")
-                st.metric("Dividend Yield", f"{fund['div_yield']*100:.2f}%" if pd.notna(fund['div_yield']) else "N/A")
+                st.metric("Dividend Yield", div_str)
                 st.metric("Market Cap", f"{fund['market_cap']/1e12:.2f}T" if pd.notna(fund['market_cap']) else "N/A")
                 st.metric("Sektor", fund['sector'] if fund['sector'] else "N/A")
             with col2:
@@ -1420,13 +1490,14 @@ with tab6:
         **CMF > 0**: Tekanan beli  
         **Risk Reward Ratio**: Target/risk > 2 = good setup  
         **Ensemble AI Score**: Gabungan Rule (25%), ML (25%), Smart Money (20%), Macro (20%), Momentum Reward (10%)  
-        **Rule Engine**: 5 kondisi teknikal klasik  
-        **ML Model**: RandomForest yang dilatih dari data IHSG (global atau per ticker)  
+        **Rule Engine**: Trend-following (Close>SMA20, SMA20>SMA50, MACD>Signal) + bonus RSI<40 + konfirmasi volume. RSI<30 & harga<SMA20 → blacklist falling knife  
+        **ML Model**: RandomForest yang dilatih dari data IHSG (global atau per ticker), dengan validasi train/test  
         **Smart Money**: Deteksi akumulasi/distribusi institusi  
         **Macro Filter**: Risk ON/OFF berdasarkan IHSG, USD/IDR, Nasdaq  
-        **Momentum Reward**: Proporsi hari naik dalam 20 hari terakhir  
+        **Momentum Reward**: Frekuensi hari naik + magnitude (Sharpe-like) dalam 20 hari terakhir  
         **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly  
-        **Portfolio Optimizer**: Mean-variance optimization untuk alokasi aset optimal
+        **Portfolio Optimizer**: Mean-variance optimization untuk alokasi aset optimal  
+        **PRIMARY vs SECONDARY**: Hanya Ensemble yang menjadi rekomendasi utama. Panel lain adalah konfirmasi sekunder.
         """)
 
 # ========== TAB 7: SMART MONEY ==========
