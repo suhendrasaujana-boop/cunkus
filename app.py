@@ -29,7 +29,7 @@ IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
 ENABLE_ML = True
 ENABLE_NEWS = False if IS_CLOUD else True
 ENABLE_SENTIMENT = False if IS_CLOUD else True
-ENABLE_MULTI_TICKER_ML = True  # Opsi B: matikan global ML di cloud
+ENABLE_MULTI_TICKER_ML = True
 
 # ========== IMPORT OPSIONAL ==========
 FEEDPARSER_AVAILABLE = False
@@ -79,15 +79,18 @@ VOLUME_SPIKE_THRESHOLD = 1.8
 BREAKOUT_COOLDOWN_HOURS = 24
 VOLUME_SPIKE_COOLDOWN_HOURS = 6
 
+SECTOR_MAP = {
+    "Bank": ["BBRI", "BMRI", "BBCA"],
+    "Mining": ["ADRO", "ITMG", "ANTM"],
+    "Telco": ["TLKM", "EXCL", "ISAT"],
+    "Consumer": ["ICBP", "INDF", "UNVR"]
+}
+
 st.set_page_config(
-    layout="wide", 
-    page_title="Smart Market Dashboard", 
+    layout="wide",
+    page_title="Smart Market Dashboard",
     page_icon="📊",
-    menu_items={
-        'Get Help': None,
-        'Report a bug': None,
-        'About': None
-    }
+    menu_items={'Get Help': None, 'Report a bug': None, 'About': None}
 )
 
 # ========== SESSION STATE ==========
@@ -111,11 +114,47 @@ if 'global_feature_names' not in st.session_state:
     st.session_state.global_feature_names = []
 
 # ========== FUNGSI BANTU ==========
-def safe_last(series: pd.Series, default=0.0):
-    return series.iloc[-1] if len(series) > 0 else default
+def safe_last(series, default=0.0):
+    """Ambil nilai terakhir dengan aman dari Series/DataFrame/scalar."""
+    if series is None:
+        return default
+    if isinstance(series, pd.DataFrame):
+        if series.empty:
+            return default
+        try:
+            series = series.squeeze()
+        except Exception:
+            return default
+    if isinstance(series, pd.Series):
+        if len(series) == 0:
+            return default
+        val = series.iloc[-1]
+        if pd.isna(val):
+            return default
+        return val
+    if isinstance(series, (int, float, np.integer, np.floating)):
+        return default if pd.isna(series) else series
+    return default
+
+def safe_mean(series, default=0.0):
+    """Rata-rata aman dari Series/DataFrame/scalar."""
+    if series is None:
+        return default
+    if isinstance(series, pd.DataFrame):
+        if series.empty:
+            return default
+        series = series.squeeze()
+    if isinstance(series, pd.Series):
+        if len(series) == 0:
+            return default
+        val = series.mean()
+        return default if pd.isna(val) else val
+    if isinstance(series, (int, float, np.integer, np.floating)):
+        return default if pd.isna(series) else series
+    return default
 
 def has_volume(volume: pd.Series) -> bool:
-    return volume is not None and volume.sum() > 0
+    return volume is not None and isinstance(volume, pd.Series) and volume.sum() > 0
 
 def safe_sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window, min_periods=1).mean()
@@ -189,6 +228,14 @@ def get_fundamental_details(ticker: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+def get_ticker_sector(ticker: str) -> Optional[str]:
+    """Ambil nama sektor untuk ticker (berdasarkan SECTOR_MAP)."""
+    t_clean = ticker.replace(".JK", "").replace("^", "").upper()
+    for sector, stocks in SECTOR_MAP.items():
+        if t_clean in stocks:
+            return sector
+    return None
+
 # ========== LOAD DATA DENGAN CACHE ==========
 @st.cache_data(ttl=CACHE_TTL, max_entries=20)
 def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
@@ -224,7 +271,7 @@ def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
                 df = df.dropna()
                 if len(df) < 20:
                     continue
-                close = df['Close']
+                close = df['Close'].squeeze()
                 rsi = ta.momentum.rsi(close, window=14).iloc[-1] if len(close) >= 14 else 50
                 sma20 = close.rolling(20).mean().iloc[-1]
                 score_val = (1 if rsi < 35 else 0) + (1 if close.iloc[-1] > sma20 else 0)
@@ -312,7 +359,6 @@ def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
     ]
     return sum(conditions) / len(conditions)
 
-# ========== RULE-BASED AI SCORE (0-5) UNTUK KOMPATIBILITAS ==========
 def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
     raw = calculate_rule_score_raw(df, volume)
     return int(round(raw * 5))
@@ -374,7 +420,7 @@ def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int =
     prob = model.predict_proba(latest)[0][1]
     return prob
 
-# ========== MULTI-TICKER GLOBAL ML (TETAP ADA UNTUK FALLBACK) ==========
+# ========== MULTI-TICKER GLOBAL ML ==========
 @st.cache_data(ttl=3600, max_entries=2)
 def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
     all_dfs = []
@@ -383,6 +429,8 @@ def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
             df = yf.download(t, period=period, interval="1d", progress=False, auto_adjust=False)
             if df.empty or len(df) < 50:
                 continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             df = df[['Open','High','Low','Close','Volume']].copy()
             df = df.dropna()
             df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
@@ -401,8 +449,7 @@ def build_multi_ticker_dataset(tickers: List[str], period: str = "2y"):
             continue
     if not all_dfs:
         return pd.DataFrame()
-    combined = pd.concat(all_dfs, ignore_index=True)
-    return combined
+    return pd.concat(all_dfs, ignore_index=True)
 
 def train_global_model(tickers: List[str]):
     if not SKLEARN_AVAILABLE:
@@ -434,14 +481,16 @@ def get_global_ml_probability(ticker_df: pd.DataFrame, volume: pd.Series, global
     features['return_5d'] = ticker_df['Close'].pct_change(5)
     features['volatility'] = ticker_df['Close'].pct_change().rolling(10).std()
     features = features.fillna(0)
-    features = features[feature_names] if all(c in features.columns for c in feature_names) else pd.DataFrame()
-    if features.empty:
+    if not all(c in features.columns for c in feature_names):
         return 0.5
-    latest = features.iloc[-1:].fillna(0)
-    prob = global_model.predict_proba(latest)[0][1]
-    return prob
+    latest = features[feature_names].iloc[-1:].fillna(0)
+    try:
+        prob = global_model.predict_proba(latest)[0][1]
+        return float(prob)
+    except Exception:
+        return 0.5
 
-# ========== SMART MONEY SCORE (NORMALIZED 0-1) ==========
+# ========== SMART MONEY SCORE ==========
 def calculate_smart_money_score_normalized(df):
     if df.empty or len(df) < 20:
         return 0.5
@@ -489,12 +538,25 @@ def get_macro_score_normalized():
 # ========== GLOBAL MACRO CACHE (ASYNC) ==========
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_macro_data_async():
+    def _extract_close(df):
+        if df is None or df.empty:
+            return pd.Series(dtype=float)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if 'Close' not in df.columns:
+            return pd.Series(dtype=float)
+        s = df['Close']
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        return s.dropna()
+
     def download_ihsg():
-        return yf.download("^JKSE", period="5d", progress=False)['Close']
+        return _extract_close(yf.download("^JKSE", period="5d", progress=False))
     def download_usd():
-        return yf.download("USDIDR=X", period="5d", progress=False)['Close']
+        return _extract_close(yf.download("USDIDR=X", period="5d", progress=False))
     def download_nasdaq():
-        return yf.download("^IXIC", period="5d", progress=False)['Close']
+        return _extract_close(yf.download("^IXIC", period="5d", progress=False))
+
     ihsg, usd, nasdaq = async_load_data([download_ihsg, download_usd, download_nasdaq])
     return ihsg, usd, nasdaq
 
@@ -502,11 +564,11 @@ def get_macro_signal():
     try:
         ihsg, usd, nasdaq = get_macro_data_async()
         score = 0
-        if safe_last(ihsg) > ihsg.mean():
+        if len(ihsg) > 0 and safe_last(ihsg) > safe_mean(ihsg):
             score += 1
-        if safe_last(usd) < usd.mean():
+        if len(usd) > 0 and safe_last(usd) < safe_mean(usd):
             score += 1
-        if safe_last(nasdaq) > nasdaq.mean():
+        if len(nasdaq) > 0 and safe_last(nasdaq) > safe_mean(nasdaq):
             score += 1
         if score >= 2:
             return "Risk ON", score
@@ -514,7 +576,7 @@ def get_macro_signal():
             return "Neutral", score
         else:
             return "Risk OFF", score
-    except:
+    except Exception:
         return "Neutral", 1
 
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
@@ -533,10 +595,15 @@ def get_sector_rotation():
                 df = yf.download(t, period="5d", progress=False, auto_adjust=False)
                 if df.empty:
                     continue
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
                 close = df['Close'].squeeze()
-                if len(close) < 2:
+                if isinstance(close, pd.DataFrame) or len(close) < 2:
                     continue
-                ret = (safe_last(close) - close.iloc[0]) / close.iloc[0]
+                first = close.iloc[0]
+                if first == 0 or pd.isna(first):
+                    continue
+                ret = (safe_last(close) - first) / first
                 returns.append(float(ret))
             except Exception:
                 continue
@@ -557,10 +624,14 @@ def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float
         for t in tickers:
             try:
                 hist = tickers_obj.tickers[t].history(period="1d")
-                if not hist.empty:
-                    prices[t] = hist['Close'].iloc[-1]
-                else:
+                if hist is None or hist.empty or 'Close' not in hist.columns:
                     prices[t] = None
+                    continue
+                close = hist['Close']
+                if isinstance(close, pd.DataFrame):
+                    close = close.squeeze()
+                val = safe_last(close, None)
+                prices[t] = float(val) if val is not None else None
             except Exception:
                 prices[t] = None
         return prices
@@ -598,7 +669,7 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
         cash = position * df['Close'].iloc[-1] * (1 - commission)
     final_capital = cash
     total_return = (final_capital - initial_capital) / initial_capital * 100
-    bh_return = (safe_last(df['Close']) / df['Close'].iloc[0] - 1) * 100
+    bh_return = (safe_last(df['Close']) / df['Close'].iloc[0] - 1) * 100 if df['Close'].iloc[0] != 0 else 0
     return {
         'final_capital': final_capital,
         'total_return': total_return,
@@ -659,15 +730,9 @@ def get_all_signals(df, volume, ticker):
         confidence += 10
     elif macro_status == "Risk OFF":
         confidence -= 10
-    sector_map = {
-        "Bank": ["BBRI", "BMRI", "BBCA"],
-        "Mining": ["ADRO", "ITMG", "ANTM"],
-        "Telco": ["TLKM", "EXCL", "ISAT"],
-        "Consumer": ["ICBP", "INDF", "UNVR"]
-    }
-    for sector, stocks in sector_map.items():
-        if ticker.replace(".JK","") in stocks and sector == best_sector:
-            confidence += 5
+    ticker_sector = get_ticker_sector(ticker)
+    if ticker_sector is not None and ticker_sector == best_sector:
+        confidence += 5
     confidence = max(0, min(100, confidence))
     return {
         'ai_score': ai_score,
@@ -678,7 +743,7 @@ def get_all_signals(df, volume, ticker):
         'best_sector': best_sector,
         'confidence': confidence
     }
-    
+
 def weighted_decision_engine(df, volume, ticker):
     signals = get_all_signals(df, volume, ticker)
     tech_score = signals['ai_score'] / 5
@@ -686,9 +751,10 @@ def weighted_decision_engine(df, volume, ticker):
     smart_score = smart_map.get(signals['smart_status'], 0.5)
     macro_map = {"Risk ON": 1, "Neutral": 0.5, "Risk OFF": 0}
     macro_score = macro_map.get(signals['macro_status'], 0.5)
-    sector_score = 1 if ticker.replace(".JK","") in signals['best_sector'] else 0.5
+    ticker_sector = get_ticker_sector(ticker)
+    sector_score = 1 if (ticker_sector is not None and ticker_sector == signals['best_sector']) else 0.5
     returns = df['Close'].pct_change().dropna()
-    vol = returns.std() * np.sqrt(252)
+    vol = returns.std() * np.sqrt(252) if len(returns) > 1 else 0
     if vol < 0.15:
         risk_score = 1
     elif vol < 0.30:
@@ -696,6 +762,8 @@ def weighted_decision_engine(df, volume, ticker):
     else:
         risk_score = 0.2
     momentum = df['Close'].pct_change(5).iloc[-1] if len(df) >= 5 else 0
+    if pd.isna(momentum):
+        momentum = 0
     if momentum > 0.05:
         momentum_score = 1
     elif momentum > 0:
@@ -712,7 +780,7 @@ def weighted_decision_engine(df, volume, ticker):
     )
     return round(final_score * 100, 2)
 
-# ========== NEW ENSEMBLE AI SCORE (DENGAN MOMENTUM REWARD) ==========
+# ========== ENSEMBLE AI SCORE ==========
 def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple[float, Dict]:
     rule_score = calculate_rule_score_raw(df, volume)
     if st.session_state.global_ml_model is not None:
@@ -723,9 +791,9 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     macro_score = get_macro_score_normalized()
     reward_score = momentum_reward_score(df, lookback=20)
     w_rule, w_ml, w_smart, w_macro, w_reward = 0.25, 0.25, 0.20, 0.20, 0.10
-    final = (w_rule * rule_score + w_ml * ml_prob + w_smart * smart_score + 
+    final = (w_rule * rule_score + w_ml * ml_prob + w_smart * smart_score +
              w_macro * macro_score + w_reward * reward_score) * 100
-    final = np.clip(final, 0, 100)
+    final = float(np.clip(final, 0, 100))
     breakdown = {
         "rule": rule_score * 100,
         "ml": ml_prob * 100,
@@ -735,9 +803,11 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     }
     return final, breakdown
 
-# ========== PORTFOLIO OPTIMIZER FUNCTIONS (MARKOWITZ) ==========
+# ========== PORTFOLIO OPTIMIZER ==========
 def get_portfolio_returns(tickers, period="1y"):
     data = yf.download(tickers, period=period, interval="1d", progress=False, auto_adjust=False)['Close']
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
     if data.empty:
         return pd.DataFrame()
     returns = data.pct_change().dropna()
@@ -771,10 +841,10 @@ with st.sidebar:
         st.info(f"Format: {ticker}")
     timeframe = st.selectbox("Timeframe", list(TIMEFRAMES.keys()))
     st.markdown("### ⚙️ Pengaturan Alert")
-    user_volume_spike = st.slider("Volume spike multiplier", 1.0, 5.0, 
+    user_volume_spike = st.slider("Volume spike multiplier", 1.0, 5.0,
                                   st.session_state.user_volume_spike_threshold, 0.1,
                                   key="user_volume_spike_slider")
-    user_breakout_cooldown = st.number_input("Breakout cooldown (jam)", 1, 72, 
+    user_breakout_cooldown = st.number_input("Breakout cooldown (jam)", 1, 72,
                                              st.session_state.user_breakout_cooldown_hours,
                                              key="user_breakout_cooldown_input")
     st.session_state.user_volume_spike_threshold = user_volume_spike
@@ -783,29 +853,27 @@ with st.sidebar:
         st.cache_data.clear()
         st.session_state.global_ml_model = None
         st.rerun()
+
+    # ========== LOAD PRE-TRAINED GLOBAL MODEL (di sidebar) ==========
+    st.markdown("---")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(current_dir, "global_model.joblib")
+    if st.session_state.global_ml_model is None:
+        if os.path.exists(model_path):
+            try:
+                saved = joblib.load(model_path)
+                st.session_state.global_ml_model = saved['model']
+                st.session_state.global_feature_names = saved['feature_names']
+                st.success("✅ Global ML model ready")
+            except Exception as e:
+                st.error(f"❌ Gagal memuat model: {e}")
+        else:
+            st.caption("ℹ️ Model global tidak ditemukan — pakai ML per ticker.")
+    else:
+        st.caption("✅ Global ML model loaded")
+
     st.markdown("---")
     st.caption("Data dari Yahoo Finance | Update 5 menit")
-
-# ========== LOAD PRE-TRAINED GLOBAL MODEL (FORCE) ==========
-import joblib
-import os
-
-# PAKSA LOAD SETIAP KALI APLIKASI DIMULAI
-current_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(current_dir, "global_model.joblib")
-
-st.write(f"🔍 Mencari model di: {model_path}")
-
-if os.path.exists(model_path):
-    try:
-        saved = joblib.load(model_path)
-        st.session_state.global_ml_model = saved['model']
-        st.session_state.global_feature_names = saved['feature_names']
-        st.success("✅ Global ML model siap! (Pre-trained dari 15 saham)")
-    except Exception as e:
-        st.error(f"❌ Gagal memuat model: {e}")
-else:
-    st.warning(f"⚠️ File model tidak ditemukan di: {model_path}")
 
 # ========== LOAD DATA ==========
 with st.spinner("Memuat data..."):
@@ -936,7 +1004,7 @@ with tab2:
         st.write("**ML Model:** RandomForest (probabilitas naik 5 hari ke depan)")
         st.write("**Smart Money:** CMF, AD trend, volume spike, price vs SMA20")
         st.write("**Macro:** IHSG trend, USD/IDR, Nasdaq")
-        st.write("**Momentum Reward:** Proporsi hari naik dalam 20 hari terakhir (reward-based)")
+        st.write("**Momentum Reward:** Proporsi hari naik dalam 20 hari terakhir")
     st.divider()
     st.subheader("🎯 Risk Meter")
     returns = data['Close'].pct_change().dropna()
@@ -952,14 +1020,11 @@ with tab2:
     else:
         annual_vol = 0.0
     if annual_vol < 15:
-        risk = "LOW"
-        st.success(f"Risk Level: {risk} ({annual_vol:.1f}% annual)")
+        st.success(f"Risk Level: LOW ({annual_vol:.1f}% annual)")
     elif annual_vol < 30:
-        risk = "MEDIUM"
-        st.warning(f"Risk Level: {risk} ({annual_vol:.1f}% annual)")
+        st.warning(f"Risk Level: MEDIUM ({annual_vol:.1f}% annual)")
     else:
-        risk = "HIGH"
-        st.error(f"Risk Level: {risk} ({annual_vol:.1f}% annual)")
+        st.error(f"Risk Level: HIGH ({annual_vol:.1f}% annual)")
 
     st.subheader("📊 Probability Engine (Rule-based)")
     bull = bear = 0
@@ -968,18 +1033,12 @@ with tab2:
     sma20 = safe_last(data['SMA20'], close)
     macd = safe_last(data['MACD'], 0)
     macd_signal = safe_last(data['MACD_signal'], 0)
-    if rsi < 35:
-        bull += 1
-    else:
-        bear += 1
-    if close > sma20:
-        bull += 1
-    else:
-        bear += 1
-    if macd > macd_signal:
-        bull += 1
-    else:
-        bear += 1
+    if rsi < 35: bull += 1
+    else: bear += 1
+    if close > sma20: bull += 1
+    else: bear += 1
+    if macd > macd_signal: bull += 1
+    else: bear += 1
     total = bull + bear
     if total > 0:
         bull_prob = (bull/total)*100
@@ -1049,12 +1108,9 @@ with tab2:
     with col_ts:
         st.subheader("📈 Trend Score")
         trend_score = 0
-        if price > safe_last(data['SMA20']):
-            trend_score += 1
-        if safe_last(data['SMA20']) > safe_last(data['SMA50']):
-            trend_score += 1
-        if safe_last(data['RSI'], 50) > 50:
-            trend_score += 1
+        if price > safe_last(data['SMA20']): trend_score += 1
+        if safe_last(data['SMA20']) > safe_last(data['SMA50']): trend_score += 1
+        if safe_last(data['RSI'], 50) > 50: trend_score += 1
         st.write(f"Trend Score: {trend_score}/3")
     with col_bs:
         st.subheader("🔥 Breakout Strength")
@@ -1066,14 +1122,10 @@ with tab2:
 
     st.header("🧠 FINAL GOD SIGNAL")
     god_score = 0
-    if rr > 2:
-        god_score += 1
-    if trend_score >= 2:
-        god_score += 1
-    if safe_last(data['RSI'], 50) < 70:
-        god_score += 1
-    if price > safe_last(data['SMA20']):
-        god_score += 1
+    if rr > 2: god_score += 1
+    if trend_score >= 2: god_score += 1
+    if safe_last(data['RSI'], 50) < 70: god_score += 1
+    if price > safe_last(data['SMA20']): god_score += 1
     if god_score >= 3:
         st.success("🚀 GOD MODE BUY")
     elif god_score == 2:
@@ -1201,7 +1253,7 @@ with tab4:
                 st.rerun()
             else:
                 st.error("Isi semua field dengan benar.")
-    
+
     if st.session_state.portfolio:
         portfolio_df = pd.DataFrame(st.session_state.portfolio)
         unique_tickers = portfolio_df['ticker'].unique().tolist()
@@ -1221,7 +1273,7 @@ with tab4:
             st.rerun()
     else:
         st.info("Belum ada posisi. Gunakan form di atas untuk menambahkan.")
-    
+
     st.divider()
     st.subheader("📐 Position Sizing Calculator")
     col_cap, col_risk, col_sl = st.columns(3)
@@ -1232,10 +1284,10 @@ with tab4:
     with col_sl:
         stoploss_price = st.number_input("Stop Loss (Rp)", min_value=0.0, value=last_close * 0.97 if last_close else 0.0)
     if capital > 0 and risk_percent > 0 and stoploss_price > 0 and last_close > 0:
-        risk_amount = capital * (risk_percent / 100)
+        risk_amount_calc = capital * (risk_percent / 100)
         price_risk = last_close - stoploss_price
         if price_risk > 0:
-            suggested_shares = int(risk_amount / price_risk)
+            suggested_shares = int(risk_amount_calc / price_risk)
             position_value = suggested_shares * last_close
             st.write(f"**Jumlah saham yang direkomendasikan:** {suggested_shares:,} lembar")
             st.write(f"Nilai posisi: Rp {position_value:,.2f} ({position_value/capital*100:.1f}% dari modal)")
@@ -1245,14 +1297,14 @@ with tab4:
             st.warning("Stop loss harus di bawah harga saat ini.")
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
-    
+
     st.divider()
     st.subheader("📊 Portfolio Optimizer (Markowitz)")
     st.markdown("Optimasi alokasi portofolio berdasarkan **mean-variance optimization** (Sharpe ratio maksimum).")
     if not SCIPY_AVAILABLE:
         st.warning("Library 'scipy' tidak tersedia. Optimizer tidak bisa berjalan. Silakan install scipy.")
     else:
-        optimizer_mode = st.radio("Pilih aset untuk optimasi:", 
+        optimizer_mode = st.radio("Pilih aset untuk optimasi:",
                                    ("Gunakan saham dari portfolio", "Pilih saham sendiri"),
                                    horizontal=True)
         if optimizer_mode == "Gunakan saham dari portfolio":
@@ -1264,7 +1316,7 @@ with tab4:
                 tickers_opt = []
         else:
             default_tickers = IHSG_BLUE_CHIPS[:5]
-            tickers_input = st.text_input("Masukkan ticker (pisahkan koma)", 
+            tickers_input = st.text_input("Masukkan ticker (pisahkan koma)",
                                           value=",".join(default_tickers),
                                           help="Contoh: BBCA.JK,BBRI.JK,TLKM.JK")
             tickers_opt = [fix_ticker(t.strip()) for t in tickers_input.split(",") if t.strip()]
@@ -1319,7 +1371,8 @@ with tab5:
         st.write(f"**Modal Akhir:** Rp {bt_result['final_capital']:,.2f}")
         if not IS_CLOUD and len(bt_result['equity_curve']) > 0:
             st.subheader("📈 Equity Curve")
-            equity_df = pd.DataFrame({'Date': data.index[:len(bt_result['equity_curve'])], 'Equity': bt_result['equity_curve']})
+            eq_len = min(len(bt_result['equity_curve']), len(data.index))
+            equity_df = pd.DataFrame({'Date': data.index[:eq_len], 'Equity': bt_result['equity_curve'][:eq_len]})
             fig_eq = go.Figure()
             fig_eq.add_trace(go.Scatter(x=equity_df['Date'], y=equity_df['Equity'], mode='lines', name='Equity'))
             fig_eq.update_layout(title="Pertumbuhan Modal", xaxis_title="Tanggal", yaxis_title="Nilai (Rp)", height=400)
@@ -1371,7 +1424,7 @@ with tab6:
         **ML Model**: RandomForest yang dilatih dari data IHSG (global atau per ticker)  
         **Smart Money**: Deteksi akumulasi/distribusi institusi  
         **Macro Filter**: Risk ON/OFF berdasarkan IHSG, USD/IDR, Nasdaq  
-        **Momentum Reward**: Proporsi hari naik dalam 20 hari terakhir (reward-based signal)  
+        **Momentum Reward**: Proporsi hari naik dalam 20 hari terakhir  
         **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly  
         **Portfolio Optimizer**: Mean-variance optimization untuk alokasi aset optimal
         """)
@@ -1419,10 +1472,19 @@ with tab8:
         ihsg, usd, nasdaq = get_macro_data_async()
         st.subheader("Data Terkini")
         col1, col2, col3 = st.columns(3)
-        col1.metric("IHSG", f"{safe_last(ihsg):.2f}", f"{((safe_last(ihsg)/ihsg.iloc[0])-1)*100:.2f}%")
-        col2.metric("USD/IDR", f"{safe_last(usd):.2f}", f"{((safe_last(usd)/usd.iloc[0])-1)*100:.2f}%")
-        col3.metric("Nasdaq", f"{safe_last(nasdaq):.2f}", f"{((safe_last(nasdaq)/nasdaq.iloc[0])-1)*100:.2f}%")
-    except:
+        if len(ihsg) > 0:
+            col1.metric("IHSG", f"{safe_last(ihsg):.2f}", f"{((safe_last(ihsg)/ihsg.iloc[0])-1)*100:.2f}%")
+        else:
+            col1.metric("IHSG", "N/A")
+        if len(usd) > 0 and usd.iloc[0] != 0:
+            col2.metric("USD/IDR", f"{safe_last(usd):.2f}", f"{((safe_last(usd)/usd.iloc[0])-1)*100:.2f}%")
+        else:
+            col2.metric("USD/IDR", "N/A")
+        if len(nasdaq) > 0 and nasdaq.iloc[0] != 0:
+            col3.metric("Nasdaq", f"{safe_last(nasdaq):.2f}", f"{((safe_last(nasdaq)/nasdaq.iloc[0])-1)*100:.2f}%")
+        else:
+            col3.metric("Nasdaq", "N/A")
+    except Exception:
         st.info("Tidak dapat mengambil data makro saat ini.")
 
 # ========== TAB 9: SECTOR FLOW ==========
