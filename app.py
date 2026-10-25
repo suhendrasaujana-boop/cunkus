@@ -6,14 +6,12 @@ import ta
 import plotly.graph_objects as go
 import numpy as np
 from datetime import datetime, date, timedelta
-import time
-import random
+# FIX #9: hapus import time & random (unused)
 from typing import Dict, List, Optional, Tuple, Any
 from plotly.subplots import make_subplots
 import os
 import gc
 import joblib
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== TAMBAHAN UNTUK PORTFOLIO OPTIMIZER ==========
 try:
@@ -26,7 +24,7 @@ except ImportError:
 IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
 
 # ========== FITUR YANG DINONAKTIFKAN DI CLOUD ==========
-ENABLE_ML = True
+# FIX #9: ENABLE_ML dihapus (tidak pernah dibaca)
 ENABLE_NEWS = False if IS_CLOUD else True
 ENABLE_SENTIMENT = False if IS_CLOUD else True
 ENABLE_MULTI_TICKER_ML = True
@@ -79,7 +77,6 @@ VOLUME_SPIKE_THRESHOLD = 1.8
 BREAKOUT_COOLDOWN_HOURS = 24
 VOLUME_SPIKE_COOLDOWN_HOURS = 6
 
-# ========== SECTOR_MAP (FIX #9: dilengkapi untuk semua blue chip) ==========
 SECTOR_MAP = {
     "Bank": ["BBRI", "BMRI", "BBCA"],
     "Mining": ["ADRO", "ITMG", "ANTM", "MDKA"],
@@ -114,10 +111,12 @@ if 'global_ml_model' not in st.session_state:
     st.session_state.global_ml_model = None
 if 'global_feature_names' not in st.session_state:
     st.session_state.global_feature_names = []
+# FIX #2: state untuk deteksi perubahan ticker
+if '_last_ticker' not in st.session_state:
+    st.session_state._last_ticker = None
 
 # ========== FUNGSI BANTU ==========
 def safe_last(series, default=0.0):
-    """Ambil nilai terakhir dengan aman dari Series/DataFrame/scalar."""
     if series is None:
         return default
     if isinstance(series, pd.DataFrame):
@@ -139,7 +138,6 @@ def safe_last(series, default=0.0):
     return default
 
 def safe_mean(series, default=0.0):
-    """Rata-rata aman dari Series/DataFrame/scalar."""
     if series is None:
         return default
     if isinstance(series, pd.DataFrame):
@@ -167,11 +165,7 @@ def fix_ticker(ticker: str) -> str:
         return ticker
     return ticker + '.JK'
 
-def async_load_data(tasks: List) -> List:
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(task) for task in tasks]
-        results = [f.result() for f in futures]
-    return results
+# FIX #6: async_load_data dihapus (tidak thread-safe untuk yfinance)
 
 def should_notify_breakout(current_price: float, resistance: float) -> bool:
     if current_price <= resistance:
@@ -231,7 +225,6 @@ def get_fundamental_details(ticker: str) -> Dict[str, Any]:
         return {}
 
 def get_ticker_sector(ticker: str) -> Optional[str]:
-    """Ambil nama sektor untuk ticker (berdasarkan SECTOR_MAP)."""
     t_clean = ticker.replace(".JK", "").replace("^", "").upper()
     for sector, stocks in SECTOR_MAP.items():
         if t_clean in stocks:
@@ -259,17 +252,24 @@ def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
         st.error(f"Error loading data for {ticker}: {e}")
         return pd.DataFrame()
 
-# ========== SCANNER ==========
+# ========== SCANNER (FIX #1: robust terhadap versi yfinance) ==========
 @st.cache_data(ttl=SCANNER_CACHE_TTL, max_entries=5)
 def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
     try:
-        all_data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker", progress=False, threads=True)
+        all_data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker",
+                               progress=False, threads=True)
+        if all_data is None or all_data.empty:
+            return pd.DataFrame()
+        is_multi = isinstance(all_data.columns, pd.MultiIndex)
         rows = []
         for ticker in tickers:
             try:
-                if ticker not in all_data.columns.get_level_values(0):
-                    continue
-                df = all_data[ticker].copy()
+                if is_multi:
+                    if ticker not in all_data.columns.get_level_values(0):
+                        continue
+                    df = all_data[ticker].copy()
+                else:
+                    df = all_data.copy()
                 df = df.dropna()
                 if len(df) < 20:
                     continue
@@ -338,7 +338,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['BB_middle'] = np.nan
         df['BB_lower'] = np.nan
 
-    # ========== FIX #4: ffill dulu, lalu RSI/MACD diisi nilai netral, baru fillna(0) ==========
     df = df.ffill()
     if 'RSI' in df.columns:
         df['RSI'] = df['RSI'].fillna(50)
@@ -350,7 +349,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ========== RULE-BASED RAW SCORE (0-1) ==========
-# FIX #2: pisahkan trend-following vs mean-reversion + blacklist falling knife
 def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
     if df.empty:
         return 0.0
@@ -363,25 +361,18 @@ def calculate_rule_score_raw(df: pd.DataFrame, volume: pd.Series) -> float:
     vol = safe_last(volume, 0)
     vol_ma = safe_last(df['Volume_MA'], 0)
 
-    # Blacklist falling knife: RSI sangat oversold + harga di bawah SMA20
     if rsi < 30 and close < sma20:
         return 0.0
 
-    # Trend-following sub-score
     trend_conditions = [
         close > sma20,
         sma20 > sma50,
         (macd > macd_signal) if not (np.isnan(macd) or np.isnan(macd_signal)) else False,
     ]
     trend_score = sum(trend_conditions) / len(trend_conditions)
-
-    # Mean-reversion bonus (bukan salah satu kondisi utama)
     meanrev_bonus = 1.0 if rsi < 40 else 0.0
-
-    # Volume confirmation
     vol_bonus = 1.0 if (has_volume(volume) and vol_ma > 0 and vol > vol_ma) else 0.0
 
-    # Kombinasi berbobot
     return 0.65 * trend_score + 0.20 * meanrev_bonus + 0.15 * vol_bonus
 
 def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
@@ -389,7 +380,6 @@ def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
     return int(round(raw * 5))
 
 # ========== MOMENTUM REWARD SIGNAL (0-1) ==========
-# FIX #8: gabungkan frekuensi + magnitude
 def momentum_reward_score(df: pd.DataFrame, lookback: int = 20) -> float:
     if df.empty or len(df) < lookback:
         return 0.5
@@ -420,15 +410,20 @@ def build_ml_features(df: pd.DataFrame, volume: pd.Series) -> pd.DataFrame:
     features['volatility'] = df['Close'].pct_change().rolling(10).std()
     return features.fillna(0)
 
+# FIX #3: create_labels eksplisit NaN → -1, bukan 0
 def create_labels(df: pd.DataFrame, forward_days: int = 5) -> pd.Series:
     future_return = df['Close'].shift(-forward_days) / df['Close'] - 1
-    return (future_return > 0).astype(int)
+    label = (future_return > 0).astype(int)
+    label[future_return.isna()] = -1
+    return label
 
-# FIX #12: tambahkan train_test_split untuk sanity check
+# FIX + tambahan guard 2-class di train_ml_model
 def train_ml_model(features: pd.DataFrame, labels: pd.Series):
     if not SKLEARN_AVAILABLE or len(features) < 50:
         return None
     try:
+        if labels.nunique() < 2:
+            return None
         if len(features) >= 100:
             X_tr, X_val, y_tr, y_val = train_test_split(
                 features, labels, test_size=0.2, random_state=42
@@ -436,7 +431,7 @@ def train_ml_model(features: pd.DataFrame, labels: pd.Series):
             probe = RandomForestClassifier(n_estimators=50, max_depth=6, random_state=42)
             probe.fit(X_tr, y_tr)
             try:
-                _ = accuracy_score(y_val, probe.predict(X_val))  # sanity check
+                _ = accuracy_score(y_val, probe.predict(X_val))
             except Exception:
                 pass
         model = RandomForestClassifier(n_estimators=80, max_depth=6, random_state=42)
@@ -445,22 +440,39 @@ def train_ml_model(features: pd.DataFrame, labels: pd.Series):
     except Exception:
         return None
 
-def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, forward_days: int = 5) -> float:
+# FIX #3 + #4: filter label -1 & cache hasil per ticker lewat session_state
+def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, ticker: str, forward_days: int = 5) -> float:
     if not SKLEARN_AVAILABLE or df.empty or len(df) < 60:
         return 0.5
+
+    sig = f"{ticker}:{len(df)}:{safe_last(df['Close'], 0):.4f}"
+    cache_key = f"_ml_pred_{ticker}"
+    cached = st.session_state.get(cache_key)
+    if cached and cached.get('sig') == sig:
+        return cached['prob']
+
     features = build_ml_features(df, volume)
     labels = create_labels(df, forward_days)
     if len(features) < 50:
         return 0.5
-    train_features = features.iloc[:-forward_days]
-    train_labels = labels.iloc[:-forward_days]
-    if len(train_features) < 30:
+
+    valid = labels >= 0
+    X = features[valid]
+    y = labels[valid]
+    if len(X) < 30:
         return 0.5
-    model = train_ml_model(train_features, train_labels)
+
+    model = train_ml_model(X, y)
     if model is None:
         return 0.5
+
     latest = features.iloc[-1:].fillna(0)
-    prob = model.predict_proba(latest)[0][1]
+    try:
+        prob = float(model.predict_proba(latest)[0][1])
+    except Exception:
+        return 0.5
+
+    st.session_state[cache_key] = {'sig': sig, 'prob': prob}
     return prob
 
 # ========== MULTI-TICKER GLOBAL ML ==========
@@ -504,7 +516,7 @@ def train_global_model(tickers: List[str]):
     feature_cols = [c for c in feature_cols if c in data.columns]
     X = data[feature_cols].fillna(0)
     y = data['target']
-    if len(X) < 100:
+    if len(X) < 100 or y.nunique() < 2:
         return None, []
     model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1)
     model.fit(X, y)
@@ -578,31 +590,40 @@ def get_macro_score_normalized():
     else:
         return 0.0
 
-# ========== GLOBAL MACRO CACHE (ASYNC) ==========
+# ========== GLOBAL MACRO CACHE (FIX #6: batch download, bukan thread) ==========
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_macro_data_async():
-    def _extract_close(df):
-        if df is None or df.empty:
-            return pd.Series(dtype=float)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if 'Close' not in df.columns:
-            return pd.Series(dtype=float)
-        s = df['Close']
-        if isinstance(s, pd.DataFrame):
-            s = s.iloc[:, 0]
-        return s.dropna()
+    empty = pd.Series(dtype=float)
+    tickers = ["^JKSE", "USDIDR=X", "^IXIC"]
+    try:
+        raw = yf.download(tickers, period="5d", progress=False,
+                          auto_adjust=False, group_by="ticker", threads=False)
+    except Exception:
+        return empty, empty, empty
+    if raw is None or raw.empty:
+        return empty, empty, empty
 
-    def download_ihsg():
-        return _extract_close(yf.download("^JKSE", period="5d", progress=False))
-    def download_usd():
-        return _extract_close(yf.download("USDIDR=X", period="5d", progress=False))
-    def download_nasdaq():
-        return _extract_close(yf.download("^IXIC", period="5d", progress=False))
+    def _extract(ticker):
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if ticker not in raw.columns.get_level_values(0):
+                    return empty
+                sub = raw[ticker]
+            else:
+                sub = raw
+            if 'Close' not in sub.columns:
+                return empty
+            s = sub['Close']
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            return s.dropna()
+        except Exception:
+            return empty
 
-    ihsg, usd, nasdaq = async_load_data([download_ihsg, download_usd, download_nasdaq])
-    return ihsg, usd, nasdaq
+    return _extract("^JKSE"), _extract("USDIDR=X"), _extract("^IXIC")
 
+# FIX #7: cache get_macro_signal agar tidak dipanggil berulang
+@st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_macro_signal():
     try:
         ihsg, usd, nasdaq = get_macro_data_async()
@@ -682,7 +703,7 @@ def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float
         st.error(f"Error fetching portfolio prices: {e}")
         return {t: None for t in tickers}
 
-# ========== BACKTEST (FIX #3 & #16) ==========
+# ========== BACKTEST ==========
 def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_period=20, commission=0.001):
     if df.empty or len(df) < 50:
         return None
@@ -700,7 +721,6 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
     for i in range(1, len(df)):
         price = df['Close'].iloc[i]
         if df['buy_signal'].iloc[i] and position == 0:
-            # FIX #3: commission dihitung saat BUY
             position = cash / (price * (1 + commission))
             cash = 0
             trades.append(('BUY', df.index[i], price))
@@ -708,17 +728,25 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
             cash = position * price * (1 - commission)
             position = 0
             trades.append(('SELL', df.index[i], price))
-        # FIX #16: equity curve konsisten dengan commission (liquidated value)
         pos_value = position * price * (1 - commission) if position > 0 else 0
         total_value = cash + pos_value
         equity_curve.append(total_value)
-    # Force close di akhir (sudah ter-account di equity curve)
+
     if position > 0:
         cash = position * df['Close'].iloc[-1] * (1 - commission)
         position = 0
+        # FIX #10: sinkronkan equity_curve terakhir dengan force close
+        if len(equity_curve) > 0:
+            equity_curve[-1] = cash
+
     final_capital = cash
     total_return = (final_capital - initial_capital) / initial_capital * 100
-    bh_return = (safe_last(df['Close']) / df['Close'].iloc[0] - 1) * 100 if df['Close'].iloc[0] != 0 else 0
+    # FIX #11: guard NaN di first_close
+    first_close = df['Close'].iloc[0]
+    if pd.notna(first_close) and first_close > 0:
+        bh_return = (safe_last(df['Close']) / first_close - 1) * 100
+    else:
+        bh_return = 0
     return {
         'final_capital': final_capital,
         'total_return': total_return,
@@ -743,7 +771,6 @@ def get_news_sentiment():
     except Exception:
         return None
 
-# FIX #18: hapus time.sleep(random...)
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_multi_timeframe_trend(ticker):
     daily = load_data(ticker, "1d")
@@ -765,13 +792,12 @@ def get_multi_timeframe_trend(ticker):
         "Monthly": trend(monthly)
     }
 
-# FIX #7: normalisasi confidence ke 0-100
 def get_all_signals(df, volume, ticker):
     ai_score = calculate_ai_score(df, volume)
     smart_score, smart_status = calculate_smart_money(df)
     macro_status, macro_score = get_macro_signal()
     best_sector, _ = get_sector_rotation()
-    confidence = ai_score * 10  # max 50
+    confidence = ai_score * 10
     if smart_status == "Accumulation":
         confidence += 15
     elif smart_status == "Distribution":
@@ -783,9 +809,7 @@ def get_all_signals(df, volume, ticker):
     ticker_sector = get_ticker_sector(ticker)
     if ticker_sector is not None and ticker_sector == best_sector:
         confidence += 5
-    # max theoretical = 50+15+10+5 = 80
     confidence = max(0, min(80, confidence))
-    # Normalisasi ke 0-100
     confidence = int(round(confidence * 100 / 80))
     return {
         'ai_score': ai_score,
@@ -797,7 +821,6 @@ def get_all_signals(df, volume, ticker):
         'confidence': confidence
     }
 
-# FIX #5 & #9: annualisasi timeframe-aware & penalty sektor
 def weighted_decision_engine(df, volume, ticker, timeframe="1d"):
     signals = get_all_signals(df, volume, ticker)
     tech_score = signals['ai_score'] / 5
@@ -807,11 +830,11 @@ def weighted_decision_engine(df, volume, ticker, timeframe="1d"):
     macro_score = macro_map.get(signals['macro_status'], 0.5)
     ticker_sector = get_ticker_sector(ticker)
     if ticker_sector is None:
-        sector_score = 0.5  # sektor tidak diketahui
+        sector_score = 0.5
     elif ticker_sector == signals['best_sector']:
         sector_score = 1.0
     else:
-        sector_score = 0.0  # sektor diketahui tapi tidak leading
+        sector_score = 0.0
     returns = df['Close'].pct_change().dropna()
     pp = {"1d": 252, "1wk": 52, "1mo": 12}.get(timeframe, 252)
     vol = returns.std() * np.sqrt(pp) if len(returns) > 1 else 0
@@ -846,7 +869,8 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     if st.session_state.global_ml_model is not None:
         ml_prob = get_global_ml_probability(df, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
     else:
-        ml_prob = ml_prediction_score(df, volume, forward_days=5)
+        # FIX #4: pass ticker untuk cache
+        ml_prob = ml_prediction_score(df, volume, ticker, forward_days=5)
     smart_score = calculate_smart_money_score_normalized(df)
     macro_score = get_macro_score_normalized()
     reward_score = momentum_reward_score(df, lookback=20)
@@ -864,16 +888,17 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     return final, breakdown
 
 # ========== PORTFOLIO OPTIMIZER ==========
-def get_portfolio_returns(tickers, period="1y"):
+# FIX #8: cache + tuple untuk hashable
+@st.cache_data(ttl=1800, max_entries=5)
+def get_portfolio_returns(tickers_tuple: Tuple[str, ...], period: str = "1y"):
+    tickers = list(tickers_tuple)
     data = yf.download(tickers, period=period, interval="1d", progress=False, auto_adjust=False)['Close']
     if isinstance(data, pd.Series):
         data = data.to_frame()
     if data.empty:
         return pd.DataFrame()
-    returns = data.pct_change().dropna()
-    return returns
+    return data.pct_change().dropna()
 
-# FIX #13: np.sqrt(max(0, ...))
 def portfolio_statistics(weights, returns, cov_matrix):
     port_return = np.sum(returns.mean() * weights) * 252
     port_var = np.dot(weights.T, np.dot(cov_matrix * 252, weights))
@@ -885,7 +910,6 @@ def negative_sharpe(weights, returns, cov_matrix):
     _, _, sharpe = portfolio_statistics(weights, returns, cov_matrix)
     return -sharpe
 
-# FIX #14: tambahkan tol/maxiter
 def optimize_portfolio(returns):
     n_assets = len(returns.columns)
     init_weights = np.array([1/n_assets] * n_assets)
@@ -903,22 +927,36 @@ with st.sidebar:
     ticker = fix_ticker(ticker_input)
     if ticker != ticker_input:
         st.info(f"Format: {ticker}")
+
+    # FIX #2: reset alert state saat ticker berubah
+    if st.session_state._last_ticker != ticker:
+        st.session_state._last_ticker = ticker
+        st.session_state.last_resistance = None
+        st.session_state.last_breakout_notify_time = None
+        st.session_state.last_volume_notify_time = None
+
     timeframe = st.selectbox("Timeframe", list(TIMEFRAMES.keys()))
     st.markdown("### ⚙️ Pengaturan Alert")
-    user_volume_spike = st.slider("Volume spike multiplier", 1.0, 5.0,
-                                  st.session_state.user_volume_spike_threshold, 0.1,
-                                  key="user_volume_spike_slider")
-    user_breakout_cooldown = st.number_input("Breakout cooldown (jam)", 1, 72,
-                                             st.session_state.user_breakout_cooldown_hours,
-                                             key="user_breakout_cooldown_input")
-    st.session_state.user_volume_spike_threshold = user_volume_spike
-    st.session_state.user_breakout_cooldown_hours = user_breakout_cooldown
+
+    # FIX #5: gunakan key saja (session_state sebagai sumber kebenaran)
+    st.slider(
+        "Volume spike multiplier", 1.0, 5.0, step=0.1,
+        key="user_volume_spike_threshold",
+    )
+    st.number_input(
+        "Breakout cooldown (jam)", 1, 72,
+        key="user_breakout_cooldown_hours",
+    )
+
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
         st.session_state.global_ml_model = None
+        # FIX #4: bersihkan cache ML per ticker
+        for k in list(st.session_state.keys()):
+            if k.startswith("_ml_pred_"):
+                del st.session_state[k]
         st.rerun()
 
-    # ========== LOAD PRE-TRAINED GLOBAL MODEL (di sidebar) ==========
     st.markdown("---")
     current_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.join(current_dir, "global_model.joblib")
@@ -949,10 +987,10 @@ if data.empty or len(data) < 5:
 
 data = add_indicators(data)
 
-# ========== ALERT CHECK (FIX #1: pakai resistance.iloc[-2]) ==========
+# ========== ALERT CHECK ==========
 if not data.empty and len(data) > 1:
     current_price = safe_last(data['Close'])
-    prev_resistance = data['resistance'].iloc[-2]  # FIX
+    prev_resistance = data['resistance'].iloc[-2]
     if should_notify_breakout(current_price, prev_resistance):
         show_notification(f"🚀 BREAKOUT! Harga menembus resistance {prev_resistance:.2f}", "toast", "🚀")
         st.session_state.last_resistance = prev_resistance
@@ -965,7 +1003,6 @@ if not data.empty and len(data) > 1:
             volume_ratio = vol_last / vol_ma
             if should_notify_volume_spike(volume_ratio):
                 show_notification(f"🔥 Volume Spike! {volume_ratio:.1f}x", "toast", "⚠️")
-                # FIX #11: setter last_volume_ratio dihapus (tidak pernah dibaca)
                 st.session_state.last_volume_notify_time = datetime.now()
 else:
     volume = data['Volume'] if 'Volume' in data.columns else pd.Series(0, index=data.index)
@@ -1038,11 +1075,12 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
 
-# ========== TAB 2: AI SIGNAL (RESTRUCTURED - FIX #6, #10) ==========
+# ========== TAB 2: AI SIGNAL (FIX #7: satu panggilan get_all_signals) ==========
 with tab2:
     final_score, breakdown = ensemble_ai_score(data, volume, ticker)
+    # FIX #7: panggil get_all_signals SEKALI
+    signals = get_all_signals(data, volume, ticker)
 
-    # ============ PRIMARY DECISION ============
     st.header("🎯 PRIMARY DECISION (Ensemble)")
     st.metric("Final AI Score", f"{final_score:.1f}%")
     if final_score >= 75:
@@ -1060,8 +1098,7 @@ with tab2:
     col1.metric("Rule Engine", f"{breakdown['rule']:.1f}%")
     col2.metric("ML Model", f"{breakdown['ml']:.1f}%")
     col3.metric("Smart Money", f"{breakdown['smart']:.1f}%")
-    macro_status_disp, _ = get_macro_signal()
-    col4.metric("Macro", macro_status_disp, delta=f"{breakdown['macro']:.1f}%")
+    col4.metric("Macro", signals['macro_status'], delta=f"{breakdown['macro']:.1f}%")
     col5.metric("Momentum Reward", f"{breakdown['reward']:.1f}%")
 
     with st.expander("Lihat Detail Komponen"):
@@ -1071,7 +1108,6 @@ with tab2:
         st.write("**Macro:** IHSG trend, USD/IDR, Nasdaq.")
         st.write("**Momentum Reward:** Frekuensi hari naik + magnitude (Sharpe-like) dalam 20 hari terakhir.")
 
-    # ============ RISK METER ============
     st.divider()
     st.subheader("🎯 Risk Meter")
     returns = data['Close'].pct_change().dropna()
@@ -1087,7 +1123,6 @@ with tab2:
     else:
         st.error(f"Risk Level: HIGH ({annual_vol:.1f}% annual)")
 
-    # ============ PROBABILITY ============
     st.subheader("📊 Probability Engine (Rule-based)")
     bull = bear = 0
     rsi = safe_last(data['RSI'], 50)
@@ -1109,7 +1144,6 @@ with tab2:
         bull_prob = bear_prob = 50
     st.write(f"📈 Bullish: {bull_prob:.1f}% | 📉 Bearish: {bear_prob:.1f}%")
 
-    # ============ MOMENTUM ============
     st.subheader("🔥 Momentum Detector")
     if len(data) >= 6:
         momentum = data['Close'].pct_change(5).iloc[-1] * 100
@@ -1126,7 +1160,6 @@ with tab2:
     else:
         st.warning("Sideways")
 
-    # ============ BREAKOUT + VOLUME ALERT ============
     col_brk, col_vol = st.columns(2)
     with col_brk:
         st.subheader("🚀 Breakout Detector")
@@ -1146,7 +1179,6 @@ with tab2:
         else:
             st.info("Volume tidak tersedia")
 
-    # ============ SECONDARY CONFIRMATIONS ============
     st.divider()
     st.subheader("🔎 Konfirmasi Sekunder (bukan rekomendasi utama)")
     st.caption("Panel di bawah ini adalah konfirmasi tambahan. Gunakan **PRIMARY DECISION** di atas sebagai rekomendasi utama.")
@@ -1217,8 +1249,8 @@ with tab2:
         st.warning("⚠️ Weak Trend")
 
     st.subheader("🏦 Smart Money Flow")
-    signals = get_all_signals(data, volume, ticker)
-    smart_score, smart_status = signals['smart_score'], signals['smart_status']
+    smart_score = signals['smart_score']
+    smart_status = signals['smart_status']
     col1, col2 = st.columns(2)
     col1.metric("Smart Money Score", f"{smart_score}/4")
     col2.metric("Status", smart_status)
@@ -1230,7 +1262,8 @@ with tab2:
         st.info("Sideways / Neutral")
 
     st.subheader("🌍 Macro Market Filter")
-    macro_status, macro_score = signals['macro_status'], signals['macro_score']
+    macro_status = signals['macro_status']
+    macro_score = signals['macro_score']
     col1, col2 = st.columns(2)
     col1.metric("Macro Condition", macro_status)
     col2.metric("Score", f"{macro_score}/3")
@@ -1244,6 +1277,7 @@ with tab2:
     st.subheader("🔄 Sector Rotation")
     best_sector = signals['best_sector']
     st.metric("Leading Sector", best_sector)
+    # Cached + hanya 1 panggilan untuk breakdown display
     _, sector_data = get_sector_rotation()
     for sector, val in sector_data.items():
         st.write(f"{sector}: {val:.2%}")
@@ -1384,7 +1418,8 @@ with tab4:
         if tickers_opt and len(tickers_opt) >= 2:
             period_opt = st.selectbox("Periode data untuk optimasi", ["1y", "2y", "6mo"], index=0)
             with st.spinner("Menghitung optimasi portofolio..."):
-                returns_opt = get_portfolio_returns(tickers_opt, period=period_opt)
+                # FIX #8: pass tuple untuk cache
+                returns_opt = get_portfolio_returns(tuple(tickers_opt), period=period_opt)
                 if returns_opt.empty or len(returns_opt.columns) < 2:
                     st.error("Data tidak cukup untuk optimasi. Coba periode lain atau periksa ticker.")
                 else:
@@ -1454,7 +1489,6 @@ with tab6:
         st.subheader("📊 Fundamental Details")
         fund = get_fundamental_details(ticker)
         if fund:
-            # FIX #17: dividendYield decimal vs percent
             div_yield_val = fund.get('div_yield')
             if div_yield_val is not None and pd.notna(div_yield_val):
                 if div_yield_val > 1:
