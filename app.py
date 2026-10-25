@@ -1183,16 +1183,62 @@ with tab2:
     st.subheader("🔎 Konfirmasi Sekunder (bukan rekomendasi utama)")
     st.caption("Panel di bawah ini adalah konfirmasi tambahan. Gunakan **PRIMARY DECISION** di atas sebagai rekomendasi utama.")
 
-    st.header("🚀 GOD MODE TRADING ENGINE (Secondary)")
+    # ============ GOD MODE (FIX: timeframe-aware support/resistance) ============
+    tf_display = {"1d": "Harian", "1wk": "Mingguan", "1mo": "Bulanan"}.get(timeframe, timeframe)
+    tf_lookback = {"1d": 60, "1wk": 13, "1mo": 3}.get(timeframe, 20)
+    tf_days_equiv = {"1d": 1, "1wk": 7, "1mo": 30}.get(timeframe, 1)
+
+    st.header(f"🚀 GOD MODE TRADING ENGINE (Secondary) — {tf_display}")
+    st.caption(
+        f"Support/Resistance dihitung dari **{min(len(data), tf_lookback)} bar {tf_display}** terakhir "
+        f"(≈ {min(len(data), tf_lookback) * tf_days_equiv} hari kalender)."
+    )
+
     price = safe_last(data['Close'])
-    support = safe_last(data['support'], price * 0.95)
-    resistance = safe_last(data['resistance'], price * 1.05)
+
+    # ---- Hitung support/resistance eksplisit dari window timeframe-aware ----
+    if len(data) >= tf_lookback:
+        recent = data.tail(tf_lookback)
+        support = float(recent['Low'].min())
+        resistance = float(recent['High'].max())
+        support_idx = recent['Low'].idxmin()
+        resistance_idx = recent['High'].idxmax()
+    else:
+        support = float(data['Low'].min())
+        resistance = float(data['High'].max())
+        support_idx = data['Low'].idxmin()
+        resistance_idx = data['High'].idxmax()
+
+    # ---- Sanity check: kalau price sangat dekat support, perluas window 3× ----
+    if support > 0 and price > 0 and (price - support) / price < 0.01:
+        wider = tf_lookback * 3
+        if len(data) >= wider:
+            wider_data = data.tail(wider)
+            support_wider = float(wider_data['Low'].min())
+            if support_wider < support:
+                support = support_wider
+                support_idx = wider_data['Low'].idxmin()
+                st.caption(
+                    f"ℹ️ Harga dekat low {tf_lookback}-bar. "
+                    f"Support diperluas ke window {wider} bar "
+                    f"(≈{wider * tf_days_equiv} hari) agar representatif."
+                )
+
+    # ---- Fallback kalau invalid ----
+    if pd.isna(support) or support <= 0:
+        support = price * 0.95
+        support_idx = data.index[-1]
+    if pd.isna(resistance) or resistance <= 0:
+        resistance = price * 1.05
+        resistance_idx = data.index[-1]
+
     entry = (support + price) / 2
     stoploss = support * 0.97
     target1 = resistance
     risk_amount = entry - stoploss
     reward = target1 - entry
     rr = reward / risk_amount if risk_amount > 0 else 0
+
     col_e, col_s, col_t = st.columns(3)
     col_e.metric("🎯 Smart Entry", f"{entry:.2f}")
     col_s.metric("🛑 Stoploss", f"{stoploss:.2f}")
@@ -1204,6 +1250,31 @@ with tab2:
         st.warning("Moderate Setup")
     else:
         st.error("Bad Setup")
+
+    # ---- Diagnostik transparansi perhitungan ----
+    with st.expander(f"🔍 Detail Perhitungan God Mode ({tf_display})"):
+        fmt = '%Y-%m-%d'
+        try:
+            support_date = pd.Timestamp(support_idx).strftime(fmt)
+        except Exception:
+            support_date = str(support_idx)
+        try:
+            resistance_date = pd.Timestamp(resistance_idx).strftime(fmt)
+        except Exception:
+            resistance_date = str(resistance_idx)
+
+        st.write(f"**Timeframe aktif:** `{timeframe}` ({tf_display})")
+        st.write(f"**Bar tersedia:** {len(data)} | **Window lookback:** {min(len(data), tf_lookback)} bar")
+        st.write(f"**Harga saat ini:** {price:.2f}")
+        st.write(f"**Support (min Low):** {support:.2f} ← dari **{support_date}**")
+        st.write(f"**Resistance (max High):** {resistance:.2f} ← dari **{resistance_date}**")
+        st.write(f"**Entry = (support + price) / 2** = ({support:.2f} + {price:.2f}) / 2 = **{entry:.2f}**")
+        st.write(f"**Stoploss = support × 0.97** = {support:.2f} × 0.97 = **{stoploss:.2f}**")
+        st.caption(
+            "💡 Jika nilai harian dan mingguan masih identik, kemungkinan **low terendah dalam window "
+            "harian juga merupakan low terendah dalam window mingguan** — window kalender-nya tumpang-tindih. "
+            "Ini bukan bug."
+        )
 
     col_ts, col_bs = st.columns(2)
     with col_ts:
