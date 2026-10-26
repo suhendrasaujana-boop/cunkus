@@ -6,7 +6,6 @@ import ta
 import plotly.graph_objects as go
 import numpy as np
 from datetime import datetime, date, timedelta
-# FIX #9: hapus import time & random (unused)
 from typing import Dict, List, Optional, Tuple, Any
 from plotly.subplots import make_subplots
 import os
@@ -24,7 +23,6 @@ except ImportError:
 IS_CLOUD = os.environ.get('STREAMLIT_SHARING_MODE', '').lower() == 'sharing'
 
 # ========== FITUR YANG DINONAKTIFKAN DI CLOUD ==========
-# FIX #9: ENABLE_ML dihapus (tidak pernah dibaca)
 ENABLE_NEWS = False if IS_CLOUD else True
 ENABLE_SENTIMENT = False if IS_CLOUD else True
 ENABLE_MULTI_TICKER_ML = True
@@ -77,6 +75,12 @@ VOLUME_SPIKE_THRESHOLD = 1.8
 BREAKOUT_COOLDOWN_HOURS = 24
 VOLUME_SPIKE_COOLDOWN_HOURS = 6
 
+# ========== PARAMETER BREAKOUT (BARU) ==========
+BREAKOUT_ATR_MULT = 0.5   # minimal 0.5×ATR di atas resistance
+BREAKOUT_MIN_PCT = 0.005  # minimal 0.5% di atas resistance
+ATR_STOP_MULT = 2.0       # Stop Loss = Entry − 2×ATR
+MAX_RISK_PCT_WARNING = 2.0  # batas toleransi risiko per trade
+
 SECTOR_MAP = {
     "Bank": ["BBRI", "BMRI", "BBCA"],
     "Mining": ["ADRO", "ITMG", "ANTM", "MDKA"],
@@ -111,7 +115,6 @@ if 'global_ml_model' not in st.session_state:
     st.session_state.global_ml_model = None
 if 'global_feature_names' not in st.session_state:
     st.session_state.global_feature_names = []
-# FIX #2: state untuk deteksi perubahan ticker
 if '_last_ticker' not in st.session_state:
     st.session_state._last_ticker = None
 
@@ -165,10 +168,56 @@ def fix_ticker(ticker: str) -> str:
         return ticker
     return ticker + '.JK'
 
-# FIX #6: async_load_data dihapus (tidak thread-safe untuk yfinance)
+# ========== BREAKOUT CONFIRMATION (BARU) ==========
+def is_confirmed_breakout(df: pd.DataFrame,
+                          atr_mult: float = BREAKOUT_ATR_MULT,
+                          min_pct: float = BREAKOUT_MIN_PCT) -> Tuple[bool, float]:
+    """
+    Deteksi breakout yang TERKONFIRMASI:
+    - Harga close (last bar) harus > resistance bar sebelumnya
+    - Kelebihan harus melewati threshold: max(min_pct × resistance, atr_mult × ATR)
+    Mengembalikan (is_breakout, excess_pct).
+    """
+    if df is None or df.empty or len(df) < 2:
+        return False, 0.0
+    last_close = safe_last(df['Close'])
+    prev_resistance = df['resistance'].iloc[-2]
+    if prev_resistance is None or prev_resistance <= 0 or pd.isna(prev_resistance):
+        return False, 0.0
+    atr = safe_last(df['ATR'], 0.0) if 'ATR' in df.columns else 0.0
+    threshold = max(prev_resistance * min_pct, atr_mult * atr if atr > 0 else 0.0)
+    if last_close > prev_resistance + threshold:
+        excess_pct = (last_close - prev_resistance) / prev_resistance * 100
+        return True, float(excess_pct)
+    return False, 0.0
 
-def should_notify_breakout(current_price: float, resistance: float) -> bool:
-    if current_price <= resistance:
+def breakout_status(df: pd.DataFrame) -> Dict[str, Any]:
+    """Status breakout lengkap untuk ditampilkan di UI."""
+    if df is None or df.empty or len(df) < 2:
+        return {"state": "no_data", "excess": 0.0, "threshold": 0.0}
+    last_close = safe_last(df['Close'])
+    prev_resistance = df['resistance'].iloc[-2]
+    if prev_resistance is None or pd.isna(prev_resistance) or prev_resistance <= 0:
+        return {"state": "no_data", "excess": 0.0, "threshold": 0.0}
+    atr = safe_last(df['ATR'], 0.0) if 'ATR' in df.columns else 0.0
+    threshold = max(prev_resistance * BREAKOUT_MIN_PCT, BREAKOUT_ATR_MULT * atr if atr > 0 else 0.0)
+    excess = last_close - prev_resistance
+    if excess > threshold:
+        return {"state": "confirmed", "excess": excess, "threshold": threshold,
+                "excess_pct": excess / prev_resistance * 100,
+                "resistance": prev_resistance, "atr": atr}
+    elif excess > 0:
+        return {"state": "pending", "excess": excess, "threshold": threshold,
+                "excess_pct": excess / prev_resistance * 100,
+                "resistance": prev_resistance, "atr": atr}
+    else:
+        return {"state": "none", "excess": excess, "threshold": threshold,
+                "resistance": prev_resistance, "atr": atr}
+
+def should_notify_breakout(current_price: float, resistance: float,
+                            atr: float = 0.0, min_pct: float = BREAKOUT_MIN_PCT) -> bool:
+    threshold = max(resistance * min_pct, BREAKOUT_ATR_MULT * atr if atr > 0 else 0.0)
+    if current_price <= resistance + threshold:
         return False
     if st.session_state.last_resistance is None:
         return True
@@ -252,7 +301,7 @@ def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
         st.error(f"Error loading data for {ticker}: {e}")
         return pd.DataFrame()
 
-# ========== SCANNER (FIX #1: robust terhadap versi yfinance) ==========
+# ========== SCANNER ==========
 @st.cache_data(ttl=SCANNER_CACHE_TTL, max_entries=5)
 def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
     try:
@@ -285,7 +334,7 @@ def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
         st.error(f"Scanner error: {e}")
         return pd.DataFrame()
 
-# ========== INDIKATOR ==========
+# ========== INDIKATOR (DITAMBAH ATR) ==========
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -337,6 +386,17 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['BB_upper'] = np.nan
         df['BB_middle'] = np.nan
         df['BB_lower'] = np.nan
+
+    # ===== ATR (Average True Range) — BARU =====
+    try:
+        if len(df) >= 14 and 'High' in df.columns and 'Low' in df.columns:
+            df['ATR'] = ta.volatility.average_true_range(
+                df['High'], df['Low'], df['Close'], window=14
+            )
+        else:
+            df['ATR'] = np.nan
+    except Exception:
+        df['ATR'] = np.nan
 
     df = df.ffill()
     if 'RSI' in df.columns:
@@ -410,14 +470,12 @@ def build_ml_features(df: pd.DataFrame, volume: pd.Series) -> pd.DataFrame:
     features['volatility'] = df['Close'].pct_change().rolling(10).std()
     return features.fillna(0)
 
-# FIX #3: create_labels eksplisit NaN → -1, bukan 0
 def create_labels(df: pd.DataFrame, forward_days: int = 5) -> pd.Series:
     future_return = df['Close'].shift(-forward_days) / df['Close'] - 1
     label = (future_return > 0).astype(int)
     label[future_return.isna()] = -1
     return label
 
-# FIX + tambahan guard 2-class di train_ml_model
 def train_ml_model(features: pd.DataFrame, labels: pd.Series):
     if not SKLEARN_AVAILABLE or len(features) < 50:
         return None
@@ -440,7 +498,6 @@ def train_ml_model(features: pd.DataFrame, labels: pd.Series):
     except Exception:
         return None
 
-# FIX #3 + #4: filter label -1 & cache hasil per ticker lewat session_state
 def ml_prediction_score(df: pd.DataFrame, volume: pd.Series, ticker: str, forward_days: int = 5) -> float:
     if not SKLEARN_AVAILABLE or df.empty or len(df) < 60:
         return 0.5
@@ -545,9 +602,9 @@ def get_global_ml_probability(ticker_df: pd.DataFrame, volume: pd.Series, global
     except Exception:
         return 0.5
 
-# ========== SMART MONEY SCORE ==========
+# ========== SMART MONEY SCORE (DIPERBAIKI: status eksplisit data kurang) ==========
 def calculate_smart_money_score_normalized(df):
-    if df.empty or len(df) < 20:
+    if df is None or df.empty or len(df) < 20:
         return 0.5
     score = 0
     if safe_last(df['CMF']) > 0:
@@ -561,8 +618,9 @@ def calculate_smart_money_score_normalized(df):
     return score / 4.0
 
 def calculate_smart_money(df):
-    if df.empty or len(df) < 20:
-        return 0, "Neutral"
+    # Validasi eksplisit: bukan nilai netral yang mengecoh
+    if df is None or df.empty or len(df) < 20:
+        return 0, "Data Tidak Cukup"
     score = 0
     if safe_last(df['CMF']) > 0:
         score += 1
@@ -590,7 +648,7 @@ def get_macro_score_normalized():
     else:
         return 0.0
 
-# ========== GLOBAL MACRO CACHE (FIX #6: batch download, bukan thread) ==========
+# ========== GLOBAL MACRO CACHE ==========
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_macro_data_async():
     empty = pd.Series(dtype=float)
@@ -622,7 +680,6 @@ def get_macro_data_async():
 
     return _extract("^JKSE"), _extract("USDIDR=X"), _extract("^IXIC")
 
-# FIX #7: cache get_macro_signal agar tidak dipanggil berulang
 @st.cache_data(ttl=CACHE_TTL, max_entries=10)
 def get_macro_signal():
     try:
@@ -703,8 +760,9 @@ def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float
         st.error(f"Error fetching portfolio prices: {e}")
         return {t: None for t in tickers}
 
-# ========== BACKTEST ==========
-def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_period=20, commission=0.001):
+# ========== BACKTEST (DIPERLUAS: MDD + Profit Factor + Win Rate) ==========
+def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70,
+                      sma_period=20, commission=0.001):
     if df.empty or len(df) < 50:
         return None
     df = df.copy()
@@ -718,42 +776,88 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
     cash = initial_capital
     trades = []
     equity_curve = [initial_capital]
+    realized_pnls = []
+    pending_entry = None  # (entry_price, shares, cost)
+
     for i in range(1, len(df)):
         price = df['Close'].iloc[i]
         if df['buy_signal'].iloc[i] and position == 0:
-            position = cash / (price * (1 + commission))
+            shares_bought = cash / (price * (1 + commission))
+            pending_entry = (price, shares_bought, cash)
+            position = shares_bought
             cash = 0
             trades.append(('BUY', df.index[i], price))
         elif df['sell_signal'].iloc[i] and position > 0:
-            cash = position * price * (1 - commission)
+            proceeds = position * price * (1 - commission)
+            if pending_entry is not None:
+                realized_pnls.append(proceeds - pending_entry[2])
+                pending_entry = None
+            cash = proceeds
             position = 0
             trades.append(('SELL', df.index[i], price))
         pos_value = position * price * (1 - commission) if position > 0 else 0
         total_value = cash + pos_value
         equity_curve.append(total_value)
 
+    # Force close di akhir periode
     if position > 0:
-        cash = position * df['Close'].iloc[-1] * (1 - commission)
+        final_price = df['Close'].iloc[-1]
+        proceeds = position * final_price * (1 - commission)
+        if pending_entry is not None:
+            realized_pnls.append(proceeds - pending_entry[2])
+            pending_entry = None
+        cash = proceeds
         position = 0
-        # FIX #10: sinkronkan equity_curve terakhir dengan force close
+        trades.append(('SELL', df.index[-1], final_price))
         if len(equity_curve) > 0:
             equity_curve[-1] = cash
+        else:
+            equity_curve.append(cash)
 
     final_capital = cash
     total_return = (final_capital - initial_capital) / initial_capital * 100
-    # FIX #11: guard NaN di first_close
     first_close = df['Close'].iloc[0]
     if pd.notna(first_close) and first_close > 0:
         bh_return = (safe_last(df['Close']) / first_close - 1) * 100
     else:
         bh_return = 0
+
+    # ===== Maximum Drawdown =====
+    if equity_curve:
+        eq = np.array(equity_curve, dtype=float)
+        running_max = np.maximum.accumulate(eq)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            drawdowns = np.where(running_max > 0, (eq - running_max) / running_max, 0.0)
+        mdd = float(drawdowns.min() * 100)
+    else:
+        mdd = 0.0
+
+    # ===== Profit Factor & Win Rate =====
+    if realized_pnls:
+        winning = sum(p for p in realized_pnls if p > 0)
+        losing = abs(sum(p for p in realized_pnls if p < 0))
+        if losing > 0:
+            profit_factor = winning / losing
+        elif winning > 0:
+            profit_factor = float('inf')
+        else:
+            profit_factor = 0.0
+        win_rate = sum(1 for p in realized_pnls if p > 0) / len(realized_pnls) * 100
+    else:
+        profit_factor = 0.0
+        win_rate = 0.0
+
     return {
         'final_capital': final_capital,
         'total_return': total_return,
         'num_trades': len(trades),
         'trades': trades,
         'equity_curve': equity_curve,
-        'bh_return': bh_return
+        'bh_return': bh_return,
+        'mdd': mdd,
+        'profit_factor': profit_factor,
+        'win_rate': win_rate,
+        'realized_pnls': realized_pnls,
     }
 
 def get_news_sentiment():
@@ -802,6 +906,8 @@ def get_all_signals(df, volume, ticker):
         confidence += 15
     elif smart_status == "Distribution":
         confidence -= 15
+    elif smart_status == "Data Tidak Cukup":
+        confidence = max(0, confidence - 10)  # penalti: data kurang
     if macro_status == "Risk ON":
         confidence += 10
     elif macro_status == "Risk OFF":
@@ -824,7 +930,7 @@ def get_all_signals(df, volume, ticker):
 def weighted_decision_engine(df, volume, ticker, timeframe="1d"):
     signals = get_all_signals(df, volume, ticker)
     tech_score = signals['ai_score'] / 5
-    smart_map = {"Accumulation": 1, "Neutral": 0.5, "Distribution": 0}
+    smart_map = {"Accumulation": 1, "Neutral": 0.5, "Distribution": 0, "Data Tidak Cukup": 0.5}
     smart_score = smart_map.get(signals['smart_status'], 0.5)
     macro_map = {"Risk ON": 1, "Neutral": 0.5, "Risk OFF": 0}
     macro_score = macro_map.get(signals['macro_status'], 0.5)
@@ -869,7 +975,6 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     if st.session_state.global_ml_model is not None:
         ml_prob = get_global_ml_probability(df, volume, st.session_state.global_ml_model, st.session_state.global_feature_names)
     else:
-        # FIX #4: pass ticker untuk cache
         ml_prob = ml_prediction_score(df, volume, ticker, forward_days=5)
     smart_score = calculate_smart_money_score_normalized(df)
     macro_score = get_macro_score_normalized()
@@ -888,7 +993,6 @@ def ensemble_ai_score(df: pd.DataFrame, volume: pd.Series, ticker: str) -> Tuple
     return final, breakdown
 
 # ========== PORTFOLIO OPTIMIZER ==========
-# FIX #8: cache + tuple untuk hashable
 @st.cache_data(ttl=1800, max_entries=5)
 def get_portfolio_returns(tickers_tuple: Tuple[str, ...], period: str = "1y"):
     tickers = list(tickers_tuple)
@@ -928,7 +1032,6 @@ with st.sidebar:
     if ticker != ticker_input:
         st.info(f"Format: {ticker}")
 
-    # FIX #2: reset alert state saat ticker berubah
     if st.session_state._last_ticker != ticker:
         st.session_state._last_ticker = ticker
         st.session_state.last_resistance = None
@@ -938,7 +1041,6 @@ with st.sidebar:
     timeframe = st.selectbox("Timeframe", list(TIMEFRAMES.keys()))
     st.markdown("### ⚙️ Pengaturan Alert")
 
-    # FIX #5: gunakan key saja (session_state sebagai sumber kebenaran)
     st.slider(
         "Volume spike multiplier", 1.0, 5.0, step=0.1,
         key="user_volume_spike_threshold",
@@ -951,7 +1053,6 @@ with st.sidebar:
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
         st.session_state.global_ml_model = None
-        # FIX #4: bersihkan cache ML per ticker
         for k in list(st.session_state.keys()):
             if k.startswith("_ml_pred_"):
                 del st.session_state[k]
@@ -987,12 +1088,26 @@ if data.empty or len(data) < 5:
 
 data = add_indicators(data)
 
-# ========== ALERT CHECK ==========
+# ===== VALIDASI DATA (BARU): peringatan jika data terbatas (saham baru/illikuid) =====
+if len(data) < 50:
+    st.warning(
+        f"⚠️ **Data historis terbatas ({len(data)} baris < 50).** "
+        f"Saham baru (IPO) atau illikuid mungkin menghasilkan sinyal kurang akurat. "
+        f"SMA50, RSI, dan ML belum sepenuhnya andal."
+    )
+
+# ========== ALERT CHECK (DIPERBAIKI: breakout dengan konfirmasi ATR) ==========
 if not data.empty and len(data) > 1:
     current_price = safe_last(data['Close'])
     prev_resistance = data['resistance'].iloc[-2]
-    if should_notify_breakout(current_price, prev_resistance):
-        show_notification(f"🚀 BREAKOUT! Harga menembus resistance {prev_resistance:.2f}", "toast", "🚀")
+    atr_val_alert = safe_last(data['ATR'], 0.0)
+    if should_notify_breakout(current_price, prev_resistance, atr_val_alert):
+        excess_pct = (current_price - prev_resistance) / prev_resistance * 100
+        show_notification(
+            f"🚀 CONFIRMED BREAKOUT! +{excess_pct:.2f}% di atas resistance "
+            f"{prev_resistance:.2f} (filter ATR aktif)",
+            "toast", "🚀"
+        )
         st.session_state.last_resistance = prev_resistance
         st.session_state.last_breakout_notify_time = datetime.now()
     volume = data['Volume'] if 'Volume' in data.columns else pd.Series(0, index=data.index)
@@ -1015,12 +1130,14 @@ last_low = safe_last(data['Low'])
 prev_close = data['Close'].iloc[-2] if len(data) > 1 else last_close
 change = last_close - prev_close
 change_pct = (change / prev_close) * 100 if prev_close != 0 else 0
+atr_display = safe_last(data['ATR'], 0.0) if 'ATR' in data.columns else 0.0
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Harga Terakhir", f"{last_close:.2f}", f"{change_pct:.2f}%", delta_color="normal")
 col2.metric("Hari Ini - Tertinggi", f"{last_high:.2f}")
 col3.metric("Hari Ini - Terendah", f"{last_low:.2f}")
-col4.metric("Volume Terakhir", f"{safe_last(volume):,.0f}" if has_volume(volume) else "N/A")
+col4.metric("ATR (14)", f"{atr_display:.2f}",
+            help="Average True Range — ukuran volatilitas. Dipakai untuk filter breakout & stop loss.")
 
 ad_val = safe_last(data['AD'])
 cmf_val = safe_last(data['CMF'])
@@ -1029,7 +1146,8 @@ cmf_status = "Akumulasi" if cmf_val > 0 else "Distribusi" if cmf_val < 0 else "N
 st.markdown(f"""
 <div style="background-color: #f0f2f6; padding: 10px; border-radius: 10px; margin-bottom: 10px;">
     <b>📊 Akumulasi/Distribusi (AD):</b> {ad_status} ({ad_val:.2f}) &nbsp;&nbsp;|&nbsp;&nbsp;
-    <b>💰 Chaikin Money Flow (CMF20):</b> {cmf_status} ({cmf_val:.3f})
+    <b>💰 Chaikin Money Flow (CMF20):</b> {cmf_status} ({cmf_val:.3f}) &nbsp;&nbsp;|&nbsp;&nbsp;
+    <b>📏 ATR(14):</b> {atr_display:.2f}
 </div>
 """, unsafe_allow_html=True)
 
@@ -1068,17 +1186,28 @@ with tab1:
     with col_m:
         st.line_chart(data[['MACD', 'MACD_signal']].tail(100))
         st.caption("MACD > Signal: Bullish")
-    st.subheader("AD & CMF")
-    col_ad, col_cmf = st.columns(2)
+    st.subheader("AD, CMF & ATR")
+    col_ad, col_cmf, col_atr = st.columns(3)
     with col_ad:
         st.line_chart(data['AD'].tail(100))
+        st.caption("Akumulasi/Distribusi")
     with col_cmf:
         st.line_chart(data['CMF'].tail(100))
+        st.caption("Chaikin Money Flow")
+    with col_atr:
+        st.line_chart(data['ATR'].tail(100))
+        st.caption("ATR (14) — Volatilitas")
 
-# ========== TAB 2: AI SIGNAL (FIX #7: satu panggilan get_all_signals) ==========
+# ========== TAB 2: AI SIGNAL ==========
 with tab2:
+    # Data quality warning
+    if len(data) < 50:
+        st.warning(
+            f"⚠️ **Data historis terbatas ({len(data)} baris < 50).** "
+            f"Sinyal ML dan Smart Money mungkin kurang akurat."
+        )
+
     final_score, breakdown = ensemble_ai_score(data, volume, ticker)
-    # FIX #7: panggil get_all_signals SEKALI
     signals = get_all_signals(data, volume, ticker)
 
     st.header("🎯 PRIMARY DECISION (Ensemble)")
@@ -1160,13 +1289,26 @@ with tab2:
     else:
         st.warning("Sideways")
 
+    # ===== BREAKOUT DETECTOR (DIPERBAIKI: konfirmasi closing + ATR) =====
     col_brk, col_vol = st.columns(2)
     with col_brk:
         st.subheader("🚀 Breakout Detector")
-        if len(data) > 1 and safe_last(data['Close']) > data['resistance'].iloc[-2]:
-            st.success("🔥 BREAKOUT DETECTED")
+        st.caption("Konfirmasi: closing di atas resistance + filter ATR (0.5×ATR atau 0.5% dari resistance).")
+        bs = breakout_status(data)
+        if bs['state'] == "confirmed":
+            st.success(
+                f"✅ CONFIRMED BREAKOUT (+{bs['excess_pct']:.2f}% di atas resistance "
+                f"{bs['resistance']:.2f}, threshold {bs['threshold']:.2f})"
+            )
+        elif bs['state'] == "pending":
+            st.warning(
+                f"⚠️ Breakout BELUM terkonfirmasi: excess {bs['excess']:.2f} "
+                f"< threshold {bs['threshold']:.2f} (butuh ≥ {bs['excess_pct']:.2f}% atau 0.5×ATR)"
+            )
+        elif bs['state'] == "no_data":
+            st.info("Data tidak cukup untuk deteksi breakout.")
         else:
-            st.info("Tidak ada breakout")
+            st.info("Tidak ada breakout (harga masih di bawah resistance).")
     with col_vol:
         st.subheader("🚨 Volume Alert")
         if has_volume(volume):
@@ -1188,15 +1330,30 @@ with tab2:
     support = safe_last(data['support'], price * 0.95)
     resistance = safe_last(data['resistance'], price * 1.05)
     entry = (support + price) / 2
-    stoploss = support * 0.97
+
+    # ===== ATR-BASED STOP LOSS (BARU) =====
+    atr_val = safe_last(data['ATR'], 0.0)
+    if atr_val > 0:
+        sl_atr = entry - ATR_STOP_MULT * atr_val
+        if 0 < sl_atr < entry:
+            stoploss = sl_atr
+            sl_method = f"ATR-based (Entry − {ATR_STOP_MULT:.0f}×ATR)"
+        else:
+            stoploss = support * 0.97
+            sl_method = "Fallback support-based (SL ATR tidak valid)"
+    else:
+        stoploss = support * 0.97
+        sl_method = "Fallback support-based (ATR tidak tersedia)"
+
     target1 = resistance
     risk_amount = entry - stoploss
     reward = target1 - entry
     rr = reward / risk_amount if risk_amount > 0 else 0
     col_e, col_s, col_t = st.columns(3)
     col_e.metric("🎯 Smart Entry", f"{entry:.2f}")
-    col_s.metric("🛑 Stoploss", f"{stoploss:.2f}")
+    col_s.metric("🛑 Stoploss", f"{stoploss:.2f}", help=sl_method)
     col_t.metric("💰 Target 1", f"{target1:.2f}")
+    st.caption(f"**Stop Loss method:** {sl_method} | ATR(14) = {atr_val:.2f}")
     st.write(f"**Risk Reward Ratio:** 1 : {rr:.2f}")
     if rr > 2:
         st.success("Good Trade Setup")
@@ -1205,7 +1362,7 @@ with tab2:
     else:
         st.error("Bad Setup")
 
-    col_ts, col_bs = st.columns(2)
+    col_ts, col_bs2 = st.columns(2)
     with col_ts:
         st.subheader("📈 Trend Score")
         trend_score = 0
@@ -1213,11 +1370,13 @@ with tab2:
         if safe_last(data['SMA20']) > safe_last(data['SMA50']): trend_score += 1
         if safe_last(data['RSI'], 50) > 50: trend_score += 1
         st.write(f"Trend Score: {trend_score}/3")
-    with col_bs:
+    with col_bs2:
         st.subheader("🔥 Breakout Strength")
-        if price > resistance:
-            strength = (price - resistance) / resistance * 100
-            st.success(f"Breakout Strength: {strength:.2f}%")
+        bs2 = breakout_status(data)
+        if bs2['state'] == "confirmed":
+            st.success(f"✅ CONFIRMED (+{bs2['excess_pct']:.2f}%, threshold {bs2['threshold']:.2f})")
+        elif bs2['state'] == "pending":
+            st.warning(f"⚠️ Belum terkonfirmasi (+{bs2['excess_pct']:.2f}%, butuh ≥ {bs2['threshold']:.2f})")
         else:
             st.write("No Breakout")
 
@@ -1258,6 +1417,8 @@ with tab2:
         st.success("💰 Smart Money Accumulating")
     elif smart_status == "Distribution":
         st.error("⚠️ Smart Money Distributing")
+    elif smart_status == "Data Tidak Cukup":
+        st.warning("⚠️ Data historis kurang (<20 baris). Smart Money tidak dapat dihitung andal — saham baru/illikuid.")
     else:
         st.info("Sideways / Neutral")
 
@@ -1277,7 +1438,6 @@ with tab2:
     st.subheader("🔄 Sector Rotation")
     best_sector = signals['best_sector']
     st.metric("Leading Sector", best_sector)
-    # Cached + hanya 1 panggilan untuk breakdown display
     _, sector_data = get_sector_rotation()
     for sector, val in sector_data.items():
         st.write(f"{sector}: {val:.2%}")
@@ -1370,14 +1530,37 @@ with tab4:
         st.info("Belum ada posisi. Gunakan form di atas untuk menambahkan.")
 
     st.divider()
+    # ===== POSITION SIZING (DIPERBAIKI: ATR-based SL + peringatan risiko) =====
     st.subheader("📐 Position Sizing Calculator")
+    atr_for_sl = safe_last(data['ATR'], 0.0)
+    atr_sl_default = (last_close - ATR_STOP_MULT * atr_for_sl) if (atr_for_sl > 0 and last_close > ATR_STOP_MULT * atr_for_sl) else (last_close * 0.97 if last_close else 0.0)
+
     col_cap, col_risk, col_sl = st.columns(3)
     with col_cap:
         capital = st.number_input("Modal (Rp)", min_value=0.0, value=100_000_000.0, step=10_000_000.0)
     with col_risk:
         risk_percent = st.number_input("Risiko per Trade (%)", min_value=0.0, max_value=100.0, value=2.0, step=0.5)
     with col_sl:
-        stoploss_price = st.number_input("Stop Loss (Rp)", min_value=0.0, value=last_close * 0.97 if last_close else 0.0)
+        use_atr_sl = st.checkbox(f"Gunakan ATR-based SL (Entry − {ATR_STOP_MULT:.0f}×ATR)",
+                                 value=(atr_for_sl > 0),
+                                 help="Disarankan: menyesuaikan stop loss dengan volatilitas historis saham.")
+        if use_atr_sl and atr_for_sl > 0:
+            stoploss_price = st.number_input("Stop Loss (Rp)", min_value=0.0,
+                                             value=float(atr_sl_default), key="sl_atr_input")
+            st.caption(f"ATR(14) = {atr_for_sl:.2f} → SL = {last_close:.2f} − {ATR_STOP_MULT:.0f}×{atr_for_sl:.2f} = {atr_sl_default:.2f}")
+        else:
+            stoploss_price = st.number_input("Stop Loss (Rp)", min_value=0.0,
+                                             value=float(last_close * 0.97) if last_close else 0.0,
+                                             key="sl_manual_input")
+
+    # Peringatan risiko portofolio
+    if risk_percent > MAX_RISK_PCT_WARNING:
+        st.warning(
+            f"⚠️ **Risiko per trade ({risk_percent}%) melebihi batas toleransi umum "
+            f"({MAX_RISK_PCT_WARNING:.0f}% dari modal).** Pertimbangkan menurunkan risiko "
+            f"atau memperbesar stop loss untuk menghindari kerugian besar pada satu transaksi."
+        )
+
     if capital > 0 and risk_percent > 0 and stoploss_price > 0 and last_close > 0:
         risk_amount_calc = capital * (risk_percent / 100)
         price_risk = last_close - stoploss_price
@@ -1385,9 +1568,12 @@ with tab4:
             suggested_shares = int(risk_amount_calc / price_risk)
             position_value = suggested_shares * last_close
             st.write(f"**Jumlah saham yang direkomendasikan:** {suggested_shares:,} lembar")
+            st.write(f"**Risiko per transaksi:** Rp {risk_amount_calc:,.2f} ({risk_percent}% dari modal)")
             st.write(f"Nilai posisi: Rp {position_value:,.2f} ({position_value/capital*100:.1f}% dari modal)")
             if position_value > capital:
-                st.warning("Nilai posisi melebihi modal! Turunkan jumlah saham atau perbesar stop loss.")
+                st.error("❌ Nilai posisi melebihi modal! Turunkan jumlah saham atau perbesar stop loss.")
+            elif position_value > capital * 0.5:
+                st.warning("⚠️ Nilai posisi > 50% modal. Pertimbangkan diversifikasi.")
         else:
             st.warning("Stop loss harus di bawah harga saat ini.")
     else:
@@ -1418,7 +1604,6 @@ with tab4:
         if tickers_opt and len(tickers_opt) >= 2:
             period_opt = st.selectbox("Periode data untuk optimasi", ["1y", "2y", "6mo"], index=0)
             with st.spinner("Menghitung optimasi portofolio..."):
-                # FIX #8: pass tuple untuk cache
                 returns_opt = get_portfolio_returns(tuple(tickers_opt), period=period_opt)
                 if returns_opt.empty or len(returns_opt.columns) < 2:
                     st.error("Data tidak cukup untuk optimasi. Coba periode lain atau periksa ticker.")
@@ -1442,7 +1627,7 @@ with tab4:
         else:
             st.info("Pilih minimal 2 saham untuk optimasi.")
 
-# ========== TAB 5: BACKTEST ==========
+# ========== TAB 5: BACKTEST (DIPERLUAS: MDD + Profit Factor + Win Rate) ==========
 with tab5:
     st.header("🧪 Backtesting Strategi")
     if not has_volume(volume):
@@ -1455,16 +1640,45 @@ with tab5:
         rsi_sell = st.slider("RSI Sell Threshold", min_value=60, max_value=85, value=70, step=1)
     with col3:
         sma_period = st.slider("SMA Period", min_value=10, max_value=50, value=20, step=5)
-    commission = st.checkbox("Include Commission (0.1% per trade)", value=False)
+    commission = st.checkbox("Include Commission (0.1% per trade)", value=True,
+                             help="Disarankan aktifkan untuk hasil backtest yang realistis.")
     commission_rate = 0.001 if commission else 0
     with st.spinner("Menjalankan backtest..."):
-        bt_result = backtest_strategy(data, rsi_buy=rsi_buy, rsi_sell=rsi_sell, sma_period=sma_period, commission=commission_rate)
+        bt_result = backtest_strategy(data, rsi_buy=rsi_buy, rsi_sell=rsi_sell,
+                                      sma_period=sma_period, commission=commission_rate)
     if bt_result:
         col_ret, col_trades, col_bh = st.columns(3)
         col_ret.metric("Total Return", f"{bt_result['total_return']:.2f}%")
         col_trades.metric("Jumlah Transaksi", bt_result['num_trades'])
         col_bh.metric("Buy & Hold Return", f"{bt_result['bh_return']:.2f}%")
+
+        # ===== METRIK BARU: MDD, Profit Factor, Win Rate =====
+        col_mdd, col_pf, col_wr = st.columns(3)
+        col_mdd.metric(
+            "Max Drawdown (MDD)", f"{bt_result['mdd']:.2f}%",
+            help="Penurunan terbesar dari puncak ekuitas. Semakin kecil (mendekati 0), semakin baik."
+        )
+        pf_val = bt_result['profit_factor']
+        pf_display = "∞" if pf_val == float('inf') else f"{pf_val:.2f}"
+        col_pf.metric(
+            "Profit Factor", pf_display,
+            help="Total profit / total loss. >1 berarti profit lebih besar dari loss (profitable)."
+        )
+        col_wr.metric(
+            "Win Rate", f"{bt_result['win_rate']:.1f}%",
+            help="Persentase transaksi yang menghasilkan profit."
+        )
+
         st.write(f"**Modal Akhir:** Rp {bt_result['final_capital']:,.2f}")
+
+        # Interpretasi cepat
+        if bt_result['mdd'] < -20:
+            st.warning(f"⚠️ MDD {bt_result['mdd']:.2f}% cukup dalam. Strategi berisiko besar pada periode drawdown.")
+        if pf_val != float('inf') and pf_val < 1.0 and bt_result['num_trades'] > 0:
+            st.error(f"❌ Profit Factor {pf_val:.2f} < 1.0 — strategi merugi secara keseluruhan.")
+        elif pf_val > 1.5:
+            st.success(f"✅ Profit Factor {pf_val:.2f} > 1.5 — strategi profitable secara historis.")
+
         if not IS_CLOUD and len(bt_result['equity_curve']) > 0:
             st.subheader("📈 Equity Curve")
             eq_len = min(len(bt_result['equity_curve']), len(data.index))
@@ -1478,6 +1692,17 @@ with tab5:
                 st.dataframe(pd.DataFrame(bt_result['trades'], columns=['Tipe', 'Tanggal', 'Harga']))
             else:
                 st.info("Tidak ada transaksi.")
+        with st.expander("Lihat P&L per Transaksi"):
+            if bt_result['realized_pnls']:
+                pnl_df = pd.DataFrame({
+                    'Trade #': range(1, len(bt_result['realized_pnls']) + 1),
+                    'P&L (Rp)': [f"{p:,.0f}" for p in bt_result['realized_pnls']],
+                    'Status': ['Profit' if p > 0 else 'Loss' if p < 0 else 'Flat'
+                               for p in bt_result['realized_pnls']]
+                })
+                st.dataframe(pnl_df, use_container_width=True)
+            else:
+                st.info("Belum ada trade tertutup.")
     else:
         st.warning(f"Data tidak cukup untuk backtest. Minimal 50 baris, saat ini {len(data)} baris.")
     if IS_CLOUD:
@@ -1519,10 +1744,16 @@ with tab6:
         **RSI** < 35: Oversold | >70: Overbought  
         **SMA20/50**: Harga > SMA = uptrend  
         **MACD > Signal**: Bullish  
+        **ATR (14)**: Average True Range — ukuran volatilitas harga. Dipakai untuk filter breakout & stop loss dinamis.  
         **Volume > Volume MA**: Volume di atas rata-rata  
         **AD > 0**: Akumulasi (tekanan beli)  
         **CMF > 0**: Tekanan beli  
         **Risk Reward Ratio**: Target/risk > 2 = good setup  
+        **ATR-based Stop Loss**: SL = Entry − 2×ATR (menyesuaikan volatilitas saham).  
+        **Confirmed Breakout**: Harga close > resistance + max(0.5% × resistance, 0.5×ATR). Menghindari fake breakout.  
+        **Max Drawdown (MDD)**: Penurunan terbesar dari puncak ekuitas. Semakin kecil, semakin baik.  
+        **Profit Factor**: Total profit / total loss. >1 = profitable.  
+        **Win Rate**: Persentase transaksi profit.  
         **Ensemble AI Score**: Gabungan Rule (25%), ML (25%), Smart Money (20%), Macro (20%), Momentum Reward (10%)  
         **Rule Engine**: Trend-following (Close>SMA20, SMA20>SMA50, MACD>Signal) + bonus RSI<40 + konfirmasi volume. RSI<30 & harga<SMA20 → blacklist falling knife  
         **ML Model**: RandomForest yang dilatih dari data IHSG (global atau per ticker), dengan validasi train/test  
@@ -1534,7 +1765,7 @@ with tab6:
         **PRIMARY vs SECONDARY**: Hanya Ensemble yang menjadi rekomendasi utama. Panel lain adalah konfirmasi sekunder.
         """)
 
-# ========== TAB 7: SMART MONEY ==========
+# ========== TAB 7: SMART MONEY (DIPERBAIKI: status eksplisit) ==========
 with tab7:
     st.header("🏦 Smart Money / Bandarmology Proxy")
     st.markdown("Deteksi akumulasi/distribusi berdasarkan volume dan harga.")
@@ -1546,17 +1777,24 @@ with tab7:
             st.success("💰 Smart Money sedang mengakumulasi (tekanan beli).")
         elif smart_status == "Distribution":
             st.error("⚠️ Smart Money mendistribusikan (tekanan jual).")
+        elif smart_status == "Data Tidak Cukup":
+            st.warning(
+                "⚠️ **Data Tidak Cukup** — Saham ini memiliki <20 baris historis "
+                "(kemungkinan IPO baru atau sangat illikuid). Smart Money tidak dapat dihitung andal."
+            )
         else:
             st.info("Netral, belum ada sinyal kuat.")
-        st.subheader("Komponen Score")
-        cmf_ok = safe_last(data['CMF']) > 0
-        ad_ok = safe_last(data['AD']) > data['AD'].iloc[-5] if len(data) >= 5 else False
-        vol_ok = has_volume(data['Volume']) and safe_last(data['Volume']) > safe_last(data['Volume_MA']) * 1.5
-        price_ok = safe_last(data['Close']) > safe_last(data['SMA20'])
-        st.write(f"✅ CMF > 0: {cmf_ok}")
-        st.write(f"✅ AD Naik (5 hari): {ad_ok}")
-        st.write(f"✅ Volume Spike (>1.5x MA): {vol_ok}")
-        st.write(f"✅ Harga > SMA20: {price_ok}")
+
+        if smart_status != "Data Tidak Cukup":
+            st.subheader("Komponen Score")
+            cmf_ok = safe_last(data['CMF']) > 0
+            ad_ok = safe_last(data['AD']) > data['AD'].iloc[-5] if len(data) >= 5 else False
+            vol_ok = has_volume(data['Volume']) and safe_last(data['Volume']) > safe_last(data['Volume_MA']) * 1.5
+            price_ok = safe_last(data['Close']) > safe_last(data['SMA20'])
+            st.write(f"✅ CMF > 0: {cmf_ok}")
+            st.write(f"✅ AD Naik (5 hari): {ad_ok}")
+            st.write(f"✅ Volume Spike (>1.5x MA): {vol_ok}")
+            st.write(f"✅ Harga > SMA20: {price_ok}")
     else:
         st.warning("Data tidak cukup.")
 
@@ -1591,6 +1829,20 @@ with tab8:
             col3.metric("Nasdaq", "N/A")
     except Exception:
         st.info("Tidak dapat mengambil data makro saat ini.")
+
+    # ===== CATATAN MAKRO LANJUTAN (BARU) =====
+    st.divider()
+    st.subheader("📌 Keterbatasan & Rekomendasi Makro Lanjutan")
+    st.info(
+        "💡 **Data Net Foreign Buy/Sell & BI Rate belum terintegrasi.** "
+        "Filter makro saat ini hanya memakai IHSG, USD/IDR, dan Nasdaq. "
+        "Untuk akurasi lebih tinggi pada saham lapis kedua/ketiga, pertimbangkan menambahkan:\n\n"
+        "- **Net Foreign Flow harian** (dari IDX atau penyedia data pasar seperti RTI/Bloomberg) "
+        "— sering menjadi market mover utama di BEI.\n"
+        "- **BI Rate** (suku bunga acuan) — memengaruhi biaya modal & sektor perbankan/properti.\n"
+        "- **Yield SUN 10Y** — indikator risk appetite investor asing.\n"
+        "- **Commodity prices** (coal, CPO, nikel) — penting untuk sektor Mining/Energy."
+    )
 
 # ========== TAB 9: SECTOR FLOW ==========
 with tab9:
